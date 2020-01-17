@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -12,39 +11,72 @@ import (
 )
 
 const (
-	apiPathURI           string = "/api/v1"
-	tokenPathURI         string = "/oauth2/token"
-	cloudBaseURLTemplate string = "https://%s.secretservercloud.com"
+	cloudBaseURLTemplate string = "https://%s.secretservercloud.%s/"
+	defaultAPIPathURI    string = "/api/v1"
+	defaultTokenPathURI  string = "/oauth2/token"
+	defaultTLD           string = "com"
 )
+
+// UserCredential holds the username and password that the API should use to
+// authenticate to the REST API
+type UserCredential struct {
+	Username, Password string
+}
 
 // Configuration settings for the API
 type Configuration struct {
-	Username, Password, ServerURL, Tenant string
+	Credentials                                      UserCredential
+	ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
 }
 
 // Server provides access to secrets stored in Thycotic Secret Server
 type Server struct {
-	config Configuration
+	Configuration
 }
 
 // New returns an initialized Secrets object
-func New(config Configuration) *Server {
-	return &Server{config}
+func New(config Configuration) (*Server, error) {
+	if config.ServerURL == "" && config.Tenant == "" || config.ServerURL != "" && config.Tenant != "" {
+		return nil, fmt.Errorf("Either ServerURL or Tenant must be set")
+	}
+	if config.TLD == "" {
+		config.TLD = defaultTLD
+	}
+	if config.apiPathURI == "" {
+		config.apiPathURI = defaultAPIPathURI
+	}
+	config.apiPathURI = strings.Trim(config.apiPathURI, "/")
+	if config.tokenPathURI == "" {
+		config.tokenPathURI = defaultTokenPathURI
+	}
+	config.tokenPathURI = strings.Trim(config.tokenPathURI, "/")
+	return &Server{config}, nil
 }
 
-// baseURL constructs the base URL of the server by either returning the
-// interpolation of the configured tenant into the cloudBaseURLTemplate,
-// or returning the configured server_url
-func baseURL(config Configuration) string {
-	if config.Tenant != "" {
-		return fmt.Sprintf(cloudBaseURLTemplate, config.Tenant)
+// urlFor is the URL for the given resource and path
+func (s Server) urlFor(resource, path string) string {
+	var baseURL string
+
+	if s.ServerURL == "" {
+		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
+	} else {
+		baseURL = s.ServerURL
 	}
-	return strings.TrimRight(config.ServerURL, "/")
+
+	switch {
+	case resource == "token":
+		return fmt.Sprintf("%s/%s", baseURL, s.tokenPathURI)
+	case path != "/":
+		path = strings.TrimLeft(path, "/")
+		fallthrough
+	default:
+		return fmt.Sprintf("%s/%s/%s/%s", baseURL, s.apiPathURI, strings.Trim(resource, "/"), path)
+	}
 }
 
 // accessResource uses the accessToken to access the API resource.
 // It assumes an appropriate combination of method, resource, path and input.
-func accessResource(method, resource, path string, input interface{}, config Configuration) ([]byte, error) {
+func (s Server) accessResource(method, resource, path string, input interface{}) ([]byte, error) {
 	switch resource {
 	case "secrets":
 	default:
@@ -54,7 +86,6 @@ func accessResource(method, resource, path string, input interface{}, config Con
 		return nil, fmt.Errorf(message)
 	}
 
-	url := fmt.Sprintf("%s/%s/%s/%s", baseURL(config), apiPathURI, resource, strings.TrimLeft(path, "/"))
 	body := bytes.NewBuffer([]byte{})
 
 	if input != nil {
@@ -66,14 +97,14 @@ func accessResource(method, resource, path string, input interface{}, config Con
 		}
 	}
 
-	req, err := http.NewRequest(method, url, body)
+	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
 
 	if err != nil {
 		log.Printf("[DEBUG] creating req: %s /%s/%s: %s", method, resource, path, err)
 		return nil, err
 	}
 
-	accessToken, err := getAccessToken(config)
+	accessToken, err := s.getAccessToken()
 
 	if err != nil {
 		log.Print("[DEBUG] error getting accessToken:", err)
@@ -94,73 +125,31 @@ func accessResource(method, resource, path string, input interface{}, config Con
 	return data, err
 }
 
-// accessGrant is the response of a successful getAccessToken call
-type accessGrant struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
-}
-
-// grant is the (cached) accessGrant
-var grant *accessGrant // TODO proper caching and expiration checking
-
-// getAccessToken uses the username and password, to call the token
+// getAccessToken gets an OAuth2 Access Grant and returns the token
 // endpoint and get an accessGrant.
-func getAccessToken(config Configuration) (string, error) {
-	if grant != nil {
-		return grant.AccessToken, nil
-	}
-
-	endpoint := baseURL(config) + tokenPathURI
-
-	log.Printf("[DEBUG] calling %s as %s", endpoint, config.Username)
-
+func (s Server) getAccessToken() (string, error) {
 	body := strings.NewReader(url.Values{
-		"username":   {config.Username},
-		"password":   {config.Password},
+		"username":   {s.Credentials.Username},
+		"password":   {s.Credentials.Password},
 		"grant_type": {"password"},
 	}.Encode())
-	data, _, err := handleResponse(http.Post(endpoint, "application/x-www-form-urlencoded", body))
+	data, _, err := handleResponse(http.Post(s.urlFor("token", ""), "application/x-www-form-urlencoded", body))
 
 	if err != nil {
 		log.Print("[DEBUG] grant response error:", err)
 		return "", err
 	}
 
-	newGrant := new(accessGrant)
+	grant := struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		TokenType    string `json:"token_type"`
+		ExpiresIn    int    `json:"expires_in"`
+	}{}
 
-	if err = json.Unmarshal(data, &newGrant); err != nil {
+	if err = json.Unmarshal(data, &grant); err != nil {
 		log.Print("[INFO] parsing grant response:", err)
 		return "", err
 	}
-
-	grant = newGrant
-
 	return grant.AccessToken, nil
-}
-
-// handleResponse processes the response according to the HTTP status
-func handleResponse(res *http.Response, err error) ([]byte, *http.Response, error) {
-	if err != nil { // fall-through if there was an underlying err
-		return nil, res, err
-	}
-
-	data, err := ioutil.ReadAll(res.Body)
-
-	if err != nil {
-		return nil, res, err
-	}
-
-	// if the response was 2xx then return it, otherwise, consider it an error
-	if res.StatusCode > 199 && res.StatusCode < 300 {
-		return data, res, nil
-	}
-
-	// truncate the data to 64 bytes before returning it as part of the error
-	if len(data) > 64 {
-		data = append(data[:64], []byte("...")...)
-	}
-
-	return nil, res, fmt.Errorf("%s: %s", res.Status, string(data))
 }

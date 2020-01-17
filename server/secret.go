@@ -30,7 +30,7 @@ type SecretField struct {
 func (s Server) Secret(id int) (*Secret, error) {
 	secret := new(Secret)
 
-	if data, err := accessResource("GET", resource, strconv.Itoa(id), nil, s.config); err == nil {
+	if data, err := s.accessResource("GET", resource, strconv.Itoa(id), nil); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
 			log.Printf("[DEBUG] error parsing response from /%s/%d: %q", resource, id, data)
 			return nil, err
@@ -45,7 +45,7 @@ func (s Server) Secret(id int) (*Secret, error) {
 		if element.FileAttachmentID != 0 {
 			path := fmt.Sprintf("%d/fields/%s", id, element.Slug)
 
-			if data, err := accessResource("GET", resource, path, nil, s.config); err == nil {
+			if data, err := s.accessResource("GET", resource, path, nil); err == nil {
 				secret.Fields[index].ItemValue = string(data)
 			} else {
 				return nil, err
