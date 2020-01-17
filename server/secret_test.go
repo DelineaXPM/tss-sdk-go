@@ -14,7 +14,13 @@ func TestSecret(t *testing.T) {
 		json.Unmarshal(cj, &config)
 	}
 
-	tss, _ := New(*config)
+	tss, err := New(*config)
+
+	if err != nil {
+		t.Error("configuring the Server:", err)
+		return
+	}
+
 	s, err := tss.Secret(1)
 
 	if err != nil {
