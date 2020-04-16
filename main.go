@@ -2,16 +2,19 @@ package main
 
 import (
 	"fmt"
-	"github.com/thycotic/tss-sdk-go/server"
 	"log"
 	"os"
+
+	"github.com/thycotic/tss-sdk-go/server"
 )
 
 func main() {
-	tss := server.New(server.Configuration{
-		Username: os.Getenv("TSS_API_USERNAME"),
-		Password: os.Getenv("TSS_API_PASSWORD"),
-		Tenant:   os.Getenv("TSS_API_TENANT"),
+	tss, _ := server.New(server.Configuration{
+		Credentials: server.UserCredential{
+			Username: os.Getenv("TSS_USERNAME"),
+			Password: os.Getenv("TSS_PASSWORD"),
+		},
+		Tenant: os.Getenv("TSS_TENANT"),
 	})
 	s, err := tss.Secret(1)
 
