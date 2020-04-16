@@ -1,5 +1,7 @@
 # The Thycotic Secret Server SDK for Go
 
+![Tests](https://github.com/thycotic/tss-sdk-go/workflows/Tests/badge.svg)
+
 A Golang API and examples for [Thycotic](https://thycotic.com/)
 [Secret Server](https://thycotic.com/products/secret-server/).
 
