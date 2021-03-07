@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,6 +31,7 @@ type UserCredential struct {
 type Configuration struct {
 	Credentials                                      UserCredential
 	ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
+	TLSClientConfig                                  *tls.Config
 }
 
 // Server provides access to secrets stored in Thycotic Secret Server
@@ -44,6 +46,9 @@ func New(config Configuration) (*Server, error) {
 	}
 	if config.TLD == "" {
 		config.TLD = defaultTLD
+	}
+	if config.TLSClientConfig != nil {
+		http.DefaultTransport.(*http.Transport).TLSClientConfig = config.TLSClientConfig
 	}
 	if config.apiPathURI == "" {
 		config.apiPathURI = defaultAPIPathURI
