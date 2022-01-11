@@ -37,7 +37,7 @@ func (s Server) Secret(id int) (*Secret, error) {
 
 	if data, err := s.accessResource("GET", resource, strconv.Itoa(id), nil); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
-			log.Printf("[DEBUG] error parsing response from /%s/%d: %q", resource, id, data)
+			log.Printf("[ERROR] error parsing response from /%s/%d: %q", resource, id, data)
 			return nil, err
 		}
 	} else {
@@ -85,7 +85,7 @@ func (s Server) writeSecret(secret Secret, method string, path string) (*Secret,
 
 	if data, err := s.accessResource(method, resource, path, secret); err == nil {
 		if err = json.Unmarshal(data, writtenSecret); err != nil {
-			log.Printf("[DEBUG] error parsing response from /%s: %q", resource, data)
+			log.Printf("[ERROR] error parsing response from /%s: %q", resource, data)
 			return nil, err
 		}
 	} else {

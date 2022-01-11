@@ -24,7 +24,7 @@ func TestSecret(t *testing.T) {
 	s, err := tss.Secret(id)
 
 	if err != nil {
-		t.Error("calling secrets.Secret:", err)
+		t.Error("calling server.Secret:", err)
 		return
 	}
 
@@ -69,24 +69,24 @@ func TestSecretCRUD(t *testing.T) {
 	refSecret.Fields[0].FieldID = fieldId
 	refSecret.Fields[0].ItemValue = password
 	sc, err := tss.CreateSecret(*refSecret)
-	if err != nil { t.Error("calling secrets.CreateSecret:", err); return }
+	if err != nil { t.Error("calling server.CreateSecret:", err); return }
 	if sc == nil { t.Error("created secret data is nil"); return }
 	if !validate("created secret folder id", folderId, sc.FolderID, t) { return }
 	if !validate("created secret template id", templateId, sc.SecretTemplateID, t) { return }
 	if !validate("created secret site id", siteId, sc.SiteID, t) { return }
 	createdPassword, matched := sc.FieldById(fieldId)
-	if !matched { t.Error("created secret does not have the given secret:", err); return }
+	if !matched { t.Errorf("created secret does not have a password field with the given field id '%d':", fieldId); return }
 	if !validate("created secret password value", password, createdPassword, t) { return }
 
 	// Test the read of the new secret
 	sr, err := tss.Secret(sc.ID)
-	if err != nil { t.Error("calling secrets.Secret:", err); return }
+	if err != nil { t.Error("calling server.Secret:", err); return }
 	if sr == nil { t.Error("read secret data is nil"); return }
 	if !validate("read secret folder id", folderId, sr.FolderID, t) { return }
 	if !validate("read secret template id", templateId, sr.SecretTemplateID, t) { return }
 	if !validate("read secret site id", siteId, sr.SiteID, t) { return }
 	readPassword, matched := sr.FieldById(fieldId)
-	if !matched { t.Error("read secret does not have the given secret:", err); return }
+	if !matched { t.Errorf("read secret does not have a password field with the given field id '%d':", fieldId); return }
 	if !validate("read secret password value", password, readPassword, t) { return }
 
 	// Test the update of the new secret
@@ -94,18 +94,18 @@ func TestSecretCRUD(t *testing.T) {
 	refSecret.ID = sc.ID
 	refSecret.Fields[0].ItemValue = newPassword
 	su, err := tss.UpdateSecret(*refSecret)
-	if err != nil { t.Error("calling secrets.UpdateSecret:", err); return }
+	if err != nil { t.Error("calling server.UpdateSecret:", err); return }
 	if su == nil { t.Error("updated secret data is nil"); return }
 	if !validate("updated secret folder id", folderId, su.FolderID, t) { return }
 	if !validate("updated secret template id", templateId, su.SecretTemplateID, t) { return }
 	if !validate("updated secret site id", siteId, su.SiteID, t) { return }
 	updatedPassword, matched := su.FieldById(fieldId)
-	if !matched { t.Error("updated secret does not have the given secret:", err); return }
+	if !matched { t.Errorf("updated secret does not have a password field with the given field id '%d':", fieldId); return }
 	if !validate("updated secret password value", newPassword, updatedPassword, t) { return }
 
 	// Test the deletion of the new secret
 	err = tss.DeleteSecret(sc.ID)
-	if err != nil { t.Error("calling secrets.DeleteSecret:", err); return }
+	if err != nil { t.Error("calling server.DeleteSecret:", err); return }
 
 	// Test read of the deleted secret fails
 	s, err := tss.Secret(sc.ID)
