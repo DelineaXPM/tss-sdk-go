@@ -9,11 +9,20 @@ on:
     # Publish `v1.2.3` tags as releases.
     tags:
       - v*
+      
+  pull_request:
+    branches:
+      - master
 
 env:
   TSS_TENANT: ${{ secrets.TSS_TENANT }}
   TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
   TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
+  TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
+  TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
+  TSS_FIELD_ID: ${{ secrets.TSS_FIELD_ID }}
+  TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
+  TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
 
 jobs:
   build:
