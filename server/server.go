@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -37,7 +39,7 @@ type Server struct {
 // New returns an initialized Secrets object
 func New(config Configuration) (*Server, error) {
 	if config.ServerURL == "" && config.Tenant == "" || config.ServerURL != "" && config.Tenant != "" {
-		return nil, fmt.Errorf("Either ServerURL or Tenant must be set")
+		return nil, fmt.Errorf("either ServerURL or Tenant must be set")
 	}
 	if config.TLD == "" {
 		config.TLD = defaultTLD
@@ -66,11 +68,12 @@ func (s Server) urlFor(resource, path string) string {
 	switch {
 	case resource == "token":
 		return fmt.Sprintf("%s/%s", baseURL, s.tokenPathURI)
-	case path != "/":
-		path = strings.TrimLeft(path, "/")
-		fallthrough
 	default:
-		return fmt.Sprintf("%s/%s/%s/%s", baseURL, s.apiPathURI, strings.Trim(resource, "/"), path)
+		return fmt.Sprintf("%s/%s/%s/%s",
+			strings.Trim(baseURL, "/"),
+			strings.Trim(s.apiPathURI, "/"),
+			strings.Trim(resource, "/"),
+			strings.Trim(path, "/"))
 	}
 }
 
@@ -79,6 +82,7 @@ func (s Server) urlFor(resource, path string) string {
 func (s Server) accessResource(method, resource, path string, input interface{}) ([]byte, error) {
 	switch resource {
 	case "secrets":
+	case "secret-templates":
 	default:
 		message := "unknown resource"
 
@@ -114,15 +118,56 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 
 	switch method {
-	case "POST", "PUT":
+	case "POST", "PUT", "PATCH":
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	log.Printf("[DEBUG] calling %s", req.URL.String())
+	log.Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
 	data, _, err := handleResponse((&http.Client{}).Do(req))
 
 	return data, err
+}
+
+// uploadFile uploads the file described in the given fileField to the
+// secret at the given secretId as a multipart/form-data request.
+func (s Server) uploadFile(secretId int, fileField SecretField) error {
+	body := bytes.NewBuffer([]byte{})
+	path := fmt.Sprintf("%d/fields/%s", secretId, fileField.Slug)
+
+	// Fetch the access token
+	accessToken, err := s.getAccessToken()
+	if err != nil {
+		log.Print("[DEBUG] error getting accessToken:", err)
+		return err
+	}
+
+	// Create the multipart form
+	multipartWriter := multipart.NewWriter(body)
+	form, err := multipartWriter.CreateFormFile("file", fileField.Filename)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(form, strings.NewReader(fileField.ItemValue))
+	if err != nil {
+		return err
+	}
+	err = multipartWriter.Close()
+	if err != nil {
+		return err
+	}
+
+	// Make the request
+	req, err := http.NewRequest("PUT", s.urlFor(resource, path), body)
+	if err != nil {
+		return err
+	}
+	req.Header.Add("Authorization", "Bearer " + accessToken)
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	log.Printf("[DEBUG] calling PUT %s", req.URL.String())
+	_, _, err = handleResponse((&http.Client{}).Do(req))
+
+	return err
 }
 
 // getAccessToken gets an OAuth2 Access Grant and returns the token

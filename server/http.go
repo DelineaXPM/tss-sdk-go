@@ -23,9 +23,9 @@ func handleResponse(res *http.Response, err error) ([]byte, *http.Response, erro
 		return data, res, nil
 	}
 
-	// truncate the data to 64 bytes before returning it as part of the error
-	if len(data) > 64 {
-		data = append(data[:64], []byte("...")...)
+	// truncate the data to 256 bytes before returning it as part of the error
+	if len(data) > 256 {
+		data = append(data[:256], []byte("...")...)
 	}
 
 	return nil, res, fmt.Errorf("%s: %s", res.Status, string(data))
