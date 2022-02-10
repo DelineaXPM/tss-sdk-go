@@ -28,4 +28,4 @@ jobs:
       - uses: actions/upload-artifact@v2
         with:
           name: artifacts
-          path: dist/**/
+          path: tss-sdk-go.exe
