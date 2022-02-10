@@ -4,7 +4,8 @@ import (
 	"testing"
 )
 
-// TestSecretTemplate tests SecretTemplate
+// TestSecretTemplate tests SecretTemplate. Referred to as
+// "Test #4" in the README.
 func TestSecretTemplate(t *testing.T) {
 	tss, err := initServer()
 	if err != nil {

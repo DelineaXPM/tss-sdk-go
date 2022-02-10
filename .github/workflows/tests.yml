@@ -20,9 +20,9 @@ env:
   TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
   TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
   TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
-  TSS_FIELD_ID: ${{ secrets.TSS_FIELD_ID }}
   TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
   TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
+  TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
 
 jobs:
   build:

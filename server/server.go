@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -132,6 +133,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 // uploadFile uploads the file described in the given fileField to the
 // secret at the given secretId as a multipart/form-data request.
 func (s Server) uploadFile(secretId int, fileField SecretField) error {
+	log.Printf("[DEBUG] uploading a file to the '%s' field with filename '%s'", fileField.Slug, fileField.Filename)
 	body := bytes.NewBuffer([]byte{})
 	path := fmt.Sprintf("%d/fields/%s", secretId, fileField.Slug)
 
@@ -144,7 +146,15 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 
 	// Create the multipart form
 	multipartWriter := multipart.NewWriter(body)
-	form, err := multipartWriter.CreateFormFile("file", fileField.Filename)
+	filename := fileField.Filename
+	if filename == "" {
+		filename = "File.txt"
+		log.Printf("[DEBUG] field has no filename, setting its filename to '%s'", filename)
+	} else if match, _ := regexp.Match("[^.]+\\.\\w+$", []byte(filename)); !match {
+		filename = filename + ".txt"
+		log.Printf("[DEBUG] field has no filename extension, setting its filename to '%s'", filename)
+	}
+	form, err := multipartWriter.CreateFormFile("file", filename)
 	if err != nil {
 		return err
 	}

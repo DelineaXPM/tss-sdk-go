@@ -14,13 +14,14 @@ const resource = "secrets"
 type Secret struct {
 	Name                                                                       string
 	FolderID, ID, SiteID, SecretTemplateID                                     int
-	SecretPolicyID, PasswordTypeWebScriptID                                    int `json:",omitempty"`
+	SecretPolicyID, PasswordTypeWebScriptID                                    int           `json:",omitempty"`
 	LauncherConnectAsSecretID, CheckOutIntervalMinutes                         int
 	Active, CheckedOut, CheckOutEnabled                                        bool
 	AutoChangeEnabled, CheckOutChangePasswordEnabled, DelayIndexing            bool
 	EnableInheritPermissions, EnableInheritSecretPolicy, ProxyEnabled          bool
 	RequiresComment, SessionRecordingEnabled, WebLauncherRequiresIncognitoMode bool
 	Fields                                                                     []SecretField `json:"Items"`
+	SshKeyArgs                                                                 *SshKeyArgs   `json:",omitempty"`
 }
 
 // SecretField is an item (field) in the secret
@@ -29,6 +30,15 @@ type SecretField struct {
 	FieldName, Slug                       string
 	FieldDescription, Filename, ItemValue string
 	IsFile, IsNotes, IsPassword           bool
+}
+
+// SshKeyArgs control whether to generate an SSH key pair and a private key
+// passphrase when the secret template supports such generation.
+//
+// WARNING: this struct is only used for write _request_ bodies, and will not
+// be present in _response_ bodies.
+type SshKeyArgs struct {
+	GeneratePassphrase, GenerateSshKeys bool
 }
 
 // Secret gets the secret with id from the Secret Server of the given tenant
@@ -66,6 +76,12 @@ func (s Server) CreateSecret(secret Secret) (*Secret, error) {
 }
 
 func (s Server) UpdateSecret(secret Secret) (*Secret, error) {
+	if secret.SshKeyArgs != nil && (secret.SshKeyArgs.GenerateSshKeys || secret.SshKeyArgs.GeneratePassphrase) {
+		err := fmt.Errorf("[ERROR] SSH key and passphrase generation is only supported during secret creation. " +
+			"Could not update the secret named '%s'", secret.Name)
+		return nil, err
+	}
+	secret.SshKeyArgs = nil
 	return s.writeSecret(secret, "PUT", strconv.Itoa(secret.ID))
 }
 
@@ -77,11 +93,43 @@ func (s Server) writeSecret(secret Secret, method string, path string) (*Secret,
 		return nil, err
 	}
 
-	fileFields, nonFileFields, err := secret.separateFileFields(template)
-	if err != nil {
-		return nil, err
+	// If the user did not request SSH key generation, separate the
+	// secret's fields into file fields and general fields, since we
+	// need to take active control of either providing the files'
+	// contents or deleting them. Otherwise, SSH key generation is
+	// responsible for populating the contents of the file fields.
+	//
+	// NOTE!!! This implies support for *either* file contents provided
+	// by the SSH generator *or* file contents provided by the user.
+	// This SDK does support secret templates that accept both kinds
+	// of file fields.
+	fileFields := make([]SecretField, 0)
+	generalFields := make([]SecretField, 0)
+	if secret.SshKeyArgs == nil || !secret.SshKeyArgs.GenerateSshKeys {
+		fileFields, generalFields, err = secret.separateFileFields(template)
+		if err != nil {
+			return nil, err
+		}
+		secret.Fields = generalFields
 	}
-	secret.Fields = nonFileFields
+
+	// If no SSH generation is called for, remove the SshKeyArgs value.
+	// Simply having the value in the Secret object causes the
+	// server to throw an error if the template is not geared towards
+	// SSH key generation, even if both of the struct's members are
+	// false.
+	if secret.SshKeyArgs != nil {
+		if !secret.SshKeyArgs.GenerateSshKeys && !secret.SshKeyArgs.GeneratePassphrase {
+			secret.SshKeyArgs = nil
+		}
+	}
+
+	// If the user specifies no items, perhaps because all the fields are
+	// generated, apply an empty array to keep the server from rejecting the
+	// request for missing a required element.
+	if secret.Fields == nil {
+		secret.Fields = make([]SecretField, 0)
+	}
 
 	if data, err := s.accessResource(method, resource, path, secret); err == nil {
 		if err = json.Unmarshal(data, writtenSecret); err != nil {

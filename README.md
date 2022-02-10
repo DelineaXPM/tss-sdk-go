@@ -116,11 +116,11 @@ The necessary configuration may also be configured from environment variables:
 | TSS_TENANT     | Name for tenants hosted in the Secret Server Cloud. This is prepended to the *.secretservercloud.com domain to determine the server URL. |
 | TSS_SERVER_URL | URL for servers not hosted in the cloud, eg: https://thycotic.mycompany.com/SecretServer                                                 |
 
-### Test #1
+### Test #1 - Read Secret Password
 Reads the secret with ID `1` or the ID passed in the `TSS_SECRET_ID` environment variable 
 and extracts the `password` field from it.
 
-### Test #2
+### Test #2 - Perform Secret CRUD
 Creates a secret with a fixed password using the values passed in the environment variables 
 below. It then reads the secret from the server, validates its values, updates it, and deletes 
 it.
@@ -130,15 +130,21 @@ it.
 | TSS_SITE_ID     | The numeric ID of the distributed engine site                                 |
 | TSS_FOLDER_ID   | The numeric ID of the folder where the secret will be created                 |
 | TSS_TEMPLATE_ID | The numeric ID of the template that defines the secret's fields               |
-| TSS_FIELD_ID    | The numeric ID of a field on the template that happens to be a password field |
 
-### Test #3
-Creates a secret with a generated password using the values passed in the environment variables 
-below. It then deletes the secret.
+### Test #3 - Perform CRUD for an SSH Key Secret
+Creates a secret with generated SSH keys using the values passed in the environment variables 
+below. It then reads the secret from the server, validates its values, updates it, and deletes it.
+
+| Env Var Name                | Description                                                                                                                       |
+|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| TSS_SITE_ID                 | The numeric ID of the distributed engine site                                                                                     |
+| TSS_FOLDER_ID               | The numeric ID of the folder where the secret will be created                                                                     |
+| TSS_SSH_KEY_TEMPLATE_ID     | The numeric ID of the template that defines the secret's fields. This template must have extended mappings that support SSH keys. |
+
+### Test #4 - Password Generation
+Retrieves the template indicated in the environment variable below, iterates its fields, and 
+validates that we can generate a password value for every field that is a password field.
 
 | Env Var Name    | Description                                                                   |
 |-----------------|-------------------------------------------------------------------------------|
-| TSS_SITE_ID     | The numeric ID of the distributed engine site                                 |
-| TSS_FOLDER_ID   | The numeric ID of the folder where the secret will be created                 |
 | TSS_TEMPLATE_ID | The numeric ID of the template that defines the secret's fields               |
-| TSS_FIELD_ID    | The numeric ID of a field on the template that happens to be a password field |
