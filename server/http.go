@@ -6,6 +6,8 @@ import (
 	"net/http"
 )
 
+const errorBodyLength = 255
+
 // handleResponse processes the response according to the HTTP status
 func handleResponse(res *http.Response, err error) ([]byte, *http.Response, error) {
 	if err != nil { // fall-through if there was an underlying err
@@ -23,9 +25,9 @@ func handleResponse(res *http.Response, err error) ([]byte, *http.Response, erro
 		return data, res, nil
 	}
 
-	// truncate the data to 256 bytes before returning it as part of the error
-	if len(data) > 256 {
-		data = append(data[:256], []byte("...")...)
+	// truncate the data to errorBodyLength bytes before returning it as part of the error
+	if len(data) >= errorBodyLength {
+		data = append(data[:errorBodyLength], []byte("...")...)
 	}
 
 	return nil, res, fmt.Errorf("%s: %s", res.Status, string(data))
