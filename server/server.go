@@ -73,7 +73,9 @@ func (s Server) urlFor(resource, path string) string {
 
 	switch {
 	case resource == "token":
-		return fmt.Sprintf("%s/%s", baseURL, s.tokenPathURI)
+		return fmt.Sprintf("%s/%s",
+			strings.Trim(baseURL, "/"),
+			strings.Trim(s.tokenPathURI, "/"))
 	default:
 		return fmt.Sprintf("%s/%s/%s/%s",
 			strings.Trim(baseURL, "/"),
@@ -177,7 +179,7 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Add("Authorization", "Bearer " + accessToken)
+	req.Header.Add("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	log.Printf("[DEBUG] uploading file with PUT %s", req.URL.String())
 	_, _, err = handleResponse((&http.Client{}).Do(req))
@@ -194,7 +196,6 @@ func (s Server) getAccessToken() (string, error) {
 		"grant_type": {"password"},
 	}
 	if s.Credentials.Domain != "" {
-
 		values["domain"] = []string{s.Credentials.Domain}
 	}
 
