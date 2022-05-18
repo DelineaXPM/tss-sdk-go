@@ -34,7 +34,7 @@ type Configuration struct {
 	TLSClientConfig                                  *tls.Config
 }
 
-// Server provides access to secrets stored in Thycotic Secret Server
+// Server provides access to secrets stored in Delinea Secret Server
 type Server struct {
 	Configuration
 }

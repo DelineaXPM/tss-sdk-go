@@ -10,7 +10,7 @@ import (
 // templateResource is the HTTP URL path component for the secret templates resource
 const templateResource = "secret-templates"
 
-// SecretTemplate represents a secret template from Thycotic Secret Server
+// SecretTemplate represents a secret template from Delinea Secret Server
 type SecretTemplate struct {
 	Name   string
 	ID     int
@@ -47,14 +47,14 @@ func (s Server) GeneratePassword(slug string, template *SecretTemplate) (string,
 
 	fieldId, found := template.FieldSlugToId(slug)
 
-	if ! found {
+	if !found {
 		log.Printf("[ERROR] the alias '%s' does not identify a field on the template named '%s'", slug, template.Name)
 	}
 	path := fmt.Sprintf("generate-password/%d", fieldId)
 
 	if data, err := s.accessResource("POST", templateResource, path, nil); err == nil {
 		passwordWithQuotes := string(data)
-		return passwordWithQuotes[1:len(passwordWithQuotes) - 1], nil
+		return passwordWithQuotes[1 : len(passwordWithQuotes)-1], nil
 	} else {
 		return "", err
 	}

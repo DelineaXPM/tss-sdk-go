@@ -10,11 +10,11 @@ import (
 // resource is the HTTP URL path component for the secrets resource
 const resource = "secrets"
 
-// Secret represents a secret from Thycotic Secret Server
+// Secret represents a secret from Delinea Secret Server
 type Secret struct {
 	Name                                                                       string
 	FolderID, ID, SiteID, SecretTemplateID                                     int
-	SecretPolicyID, PasswordTypeWebScriptID                                    int           `json:",omitempty"`
+	SecretPolicyID, PasswordTypeWebScriptID                                    int `json:",omitempty"`
 	LauncherConnectAsSecretID, CheckOutIntervalMinutes                         int
 	Active, CheckedOut, CheckOutEnabled                                        bool
 	AutoChangeEnabled, CheckOutChangePasswordEnabled, DelayIndexing            bool
@@ -77,7 +77,7 @@ func (s Server) CreateSecret(secret Secret) (*Secret, error) {
 
 func (s Server) UpdateSecret(secret Secret) (*Secret, error) {
 	if secret.SshKeyArgs != nil && (secret.SshKeyArgs.GenerateSshKeys || secret.SshKeyArgs.GeneratePassphrase) {
-		err := fmt.Errorf("[ERROR] SSH key and passphrase generation is only supported during secret creation. " +
+		err := fmt.Errorf("[ERROR] SSH key and passphrase generation is only supported during secret creation. "+
 			"Could not update the secret named '%s'", secret.Name)
 		return nil, err
 	}
@@ -181,17 +181,17 @@ func (s Secret) FieldById(fieldId int) (string, bool) {
 // file attachment.
 func (s Server) updateFiles(secretId int, fileFields []SecretField) error {
 	type fieldMod struct {
-		Slug                     string
-		Dirty                    bool
-		Value                    interface{}
+		Slug  string
+		Dirty bool
+		Value interface{}
 	}
 
 	type fieldMods struct {
-		SecretFields             []fieldMod
+		SecretFields []fieldMod
 	}
 
 	type secretPatch struct {
-		Data                     fieldMods
+		Data fieldMods
 	}
 
 	for _, element := range fileFields {
@@ -199,7 +199,7 @@ func (s Server) updateFiles(secretId int, fileFields []SecretField) error {
 		var input interface{}
 		if element.ItemValue == "" {
 			path = fmt.Sprintf("%d/general", secretId)
-			input = secretPatch{ Data: fieldMods{ SecretFields: []fieldMod{{ Slug: element.Slug, Dirty: true, Value: nil }} } }
+			input = secretPatch{Data: fieldMods{SecretFields: []fieldMod{{Slug: element.Slug, Dirty: true, Value: nil}}}}
 			if _, err := s.accessResource("PATCH", resource, path, input); err != nil {
 				return err
 			}
