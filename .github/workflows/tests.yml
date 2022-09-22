@@ -1,10 +1,11 @@
 name: Tests
 
 on:
+  workflow_dispatch:
   push:
     # Publish the `master` branch.
     branches:
-      - master
+      - main
 
     # Publish `v1.2.3` tags as releases.
     tags:
@@ -12,7 +13,7 @@ on:
       
   pull_request:
     branches:
-      - master
+      - main
 
 env:
   TSS_TENANT: ${{ secrets.TSS_TENANT }}
@@ -23,6 +24,8 @@ env:
   TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
   TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
   TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
+  TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
+  TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
 
 jobs:
   build:
