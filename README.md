@@ -141,7 +141,22 @@ below. It then reads the secret from the server, validates its values, updates i
 | TSS_FOLDER_ID               | The numeric ID of the folder where the secret will be created                                                                     |
 | TSS_SSH_KEY_TEMPLATE_ID     | The numeric ID of the template that defines the secret's fields. This template must have extended mappings that support SSH keys. |
 
-### Test #4 - Password Generation
+### Test #4 - Perform field based search for password secret
+Searches for secrets with a field value using the values passed in the environment variables below.
+
+| Env Var Name                | Description                                                                                                                       |
+|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| TSS_SEARCH_FIELD            | The secret field to be searched                                                                                                   |
+| TSS_SEARCH_TEXT             | The text to search                                                                                                                |
+
+### Test #5 - Perform search for password secret
+Searches for secrets containing text using the values passed in the environment variables below.
+
+| Env Var Name                | Description                                                                                                                       |
+|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| TSS_SEARCH_TEXT             | The text to search                                                                                                                |
+
+### Test #6 - Password Generation
 Retrieves the template indicated in the environment variable below, iterates its fields, and 
 validates that we can generate a password value for every field that is a password field.
 
