@@ -32,6 +32,11 @@ type SecretField struct {
 	IsFile, IsNotes, IsPassword           bool
 }
 
+type SearchResult struct {
+	SearchText string
+	Records    []Secret
+}
+
 // SshKeyArgs control whether to generate an SSH key pair and a private key
 // passphrase when the secret template supports such generation.
 //
@@ -69,6 +74,32 @@ func (s Server) Secret(id int) (*Secret, error) {
 	}
 
 	return secret, nil
+}
+
+// Secret gets the secret with id from the Secret Server of the given tenant
+func (s Server) Secrets(searchText, field string) ([]Secret, error) {
+	searchResult := new(SearchResult)
+	if data, err := s.searchResources(resource, searchText, field); err == nil {
+		if err = json.Unmarshal(data, searchResult); err != nil {
+			log.Printf("[ERROR] error parsing response from /%s/%s: %q", resource, searchText, data)
+			return nil, err
+		}
+	} else {
+		return nil, err
+	}
+
+	searchRecords := searchResult.Records
+	secrets := make([]Secret, len(searchRecords))
+	for i, record := range searchRecords {
+		//secrets returned in search results are not fully populated
+		secret, err := s.Secret(record.ID)
+		if err != nil {
+			return nil, err
+		}
+		secrets[i] = *secret
+	}
+
+	return secrets, nil
 }
 
 func (s Server) CreateSecret(secret Secret) (*Secret, error) {

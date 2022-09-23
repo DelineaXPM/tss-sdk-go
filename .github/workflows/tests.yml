@@ -24,6 +24,7 @@ env:
   TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
   TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
   TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
+  TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
   TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
   TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
 

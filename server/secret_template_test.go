@@ -5,7 +5,7 @@ import (
 )
 
 // TestSecretTemplate tests SecretTemplate. Referred to as
-// "Test #4" in the README.
+// "Test #6" in the README.
 func TestSecretTemplate(t *testing.T) {
 	tss, err := initServer()
 	if err != nil {
@@ -34,14 +34,14 @@ func TestSecretTemplate(t *testing.T) {
 		fieldID := field.SecretTemplateFieldID
 
 		lookupFieldId, foundFieldId := template.FieldSlugToId(fieldSlug)
-		if ! foundFieldId {
+		if !foundFieldId {
 			t.Errorf("expected to find the field slug '%s', but FieldSlugToId reported %t", fieldSlug, foundFieldId)
 		} else if fieldID != lookupFieldId {
 			t.Errorf("expected the field slug '%s' to return a field id of '%d', but '%d' was returned instead", fieldSlug, fieldID, lookupFieldId)
 		}
 
 		lookupSlug, foundSlug := template.FieldIdToSlug(fieldID)
-		if ! foundSlug {
+		if !foundSlug {
 			t.Errorf("expected to find the field ID '%d', but FieldIdToSlug reported %t", fieldID, foundSlug)
 		} else if fieldSlug != lookupSlug {
 			t.Errorf("expected the field id '%d' to return a field slug of '%s', but '%s' was returned instead", fieldID, fieldSlug, lookupSlug)

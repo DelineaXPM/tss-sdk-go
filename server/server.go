@@ -85,6 +85,31 @@ func (s Server) urlFor(resource, path string) string {
 	}
 }
 
+func (s Server) urlForSearch(resource, searchText, fieldName string) string {
+	var baseURL string
+
+	if s.ServerURL == "" {
+		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
+	} else {
+		baseURL = s.ServerURL
+	}
+	switch {
+	case resource == "secrets":
+		url := fmt.Sprintf("%s/%s/%s?paging.filter.searchText=%s&paging.filter.searchField=%s&paging.filter.doNotCalculateTotal=true&paging.take=30&&paging.skip=0",
+			strings.Trim(baseURL, "/"),
+			strings.Trim(s.apiPathURI, "/"),
+			strings.Trim(resource, "/"),
+			searchText,
+			fieldName)
+		if fieldName == "" {
+			return fmt.Sprintf("%s%s", url, "&paging.filter.extendedFields=Machine&paging.filter.extendedFields=Notes&paging.filter.extendedFields=Username")
+		}
+		return fmt.Sprintf("%s%s", url, "&paging.filter.isExactMatch=true")
+	default:
+		return ""
+	}
+}
+
 // accessResource uses the accessToken to access the API resource.
 // It assumes an appropriate combination of method, resource, path and input.
 func (s Server) accessResource(method, resource, path string, input interface{}) ([]byte, error) {
@@ -129,6 +154,45 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 	case "POST", "PUT", "PATCH":
 		req.Header.Set("Content-Type", "application/json")
 	}
+
+	log.Printf("[DEBUG] calling %s %s", method, req.URL.String())
+
+	data, _, err := handleResponse((&http.Client{}).Do(req))
+
+	return data, err
+}
+
+// searchResources uses the accessToken to search for API resources.
+// It assumes an appropriate combination of resource, search text.
+// field is optional
+func (s Server) searchResources(resource, searchText, field string) ([]byte, error) {
+	switch resource {
+	case "secrets":
+	default:
+		message := "unknown resource"
+
+		log.Printf("[ERROR] %s: %s", message, resource)
+		return nil, fmt.Errorf(message)
+	}
+
+	method := "GET"
+	body := bytes.NewBuffer([]byte{})
+
+	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
+
+	if err != nil {
+		log.Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
+		return nil, err
+	}
+
+	accessToken, err := s.getAccessToken()
+
+	if err != nil {
+		log.Print("[ERROR] error getting accessToken:", err)
+		return nil, err
+	}
+
+	req.Header.Add("Authorization", "Bearer "+accessToken)
 
 	log.Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
@@ -200,7 +264,8 @@ func (s Server) getAccessToken() (string, error) {
 	}
 
 	body := strings.NewReader(values.Encode())
-	data, _, err := handleResponse(http.Post(s.urlFor("token", ""), "application/x-www-form-urlencoded", body))
+	requestUrl := s.urlFor("token", "")
+	data, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
 
 	if err != nil {
 		log.Print("[ERROR] grant response error:", err)
