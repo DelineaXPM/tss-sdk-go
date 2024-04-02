@@ -401,6 +401,8 @@ func (s *Server) checkPlatformDetails() (string, error) {
 			}
 			if vaultURL != "" {
 				s.ServerURL = vaultURL
+			} else {
+				return "", fmt.Errorf("no configured vault found")
 			}
 
 			return advanceAuthJsonResponse.Result.OAuthTokens.AccessToken, nil
