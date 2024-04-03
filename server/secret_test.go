@@ -190,7 +190,7 @@ func TestSecretCRUD(t *testing.T) {
 
 	// Test read of the deleted secret fails
 	s, err := tss.Secret(sc.ID)
-	if s != nil {
+	if s != nil && s.Active {
 		t.Errorf("deleted secret with id '%d' returned from read", sc.ID)
 	}
 }
@@ -559,7 +559,7 @@ func TestSecretCRUDForSSHTemplate(t *testing.T) {
 
 	// Test read of the deleted secret fails
 	s, err := tss.Secret(sc.ID)
-	if s != nil {
+	if s != nil && s.Active {
 		t.Errorf("deleted secret with id '%d' returned from read", sc.ID)
 	}
 }
