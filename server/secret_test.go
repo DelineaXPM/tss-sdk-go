@@ -11,12 +11,26 @@ import (
 
 // TestSecret tests Secret. Referred to as "Test #1" in the README.
 func TestSecret(t *testing.T) {
-	tss, err := initServer()
-	if err != nil {
-		t.Error("configuring the Server:", err)
-		return
-	}
+	t.Run("SecretServer_TestSecret", func(t *testing.T) {
+		tss, err := initServer()
+		if err != nil {
+			t.Error("configuring the Server:", err)
+			return
+		}
+		GetSecret(t, tss)
+	})
 
+	t.Run("Platform_TestSecret", func(t *testing.T) {
+		tss, err := initPlatformServer()
+		if err != nil {
+			t.Error("configuring the Platform Server:", err)
+			return
+		}
+		GetSecret(t, tss)
+	})
+}
+
+func GetSecret(t *testing.T, tss *Server) {
 	id := initIntegerFromEnv("TSS_SECRET_ID", t)
 	if id < 0 {
 		return
@@ -45,13 +59,26 @@ func TestSecret(t *testing.T) {
 // TestSecretCRUD tests the creation, read, update, and delete of a Secret.
 // Referred to as "Test #2" in the README.
 func TestSecretCRUD(t *testing.T) {
+	t.Run("SecretServer_TestSecretCRUD", func(t *testing.T) {
+		tss, err := initServer()
+		if err != nil {
+			t.Error("configuring the Server:", err)
+			return
+		}
+		SecretCRUD(t, tss)
+	})
 
-	// Initialize
-	tss, err := initServer()
-	if err != nil {
-		t.Error("configuring the Server:", err)
-		return
-	}
+	t.Run("Platform_TestSecretCRUD", func(t *testing.T) {
+		tss, err := initPlatformServer()
+		if err != nil {
+			t.Error("configuring the Platform Server:", err)
+			return
+		}
+		SecretCRUD(t, tss)
+	})
+}
+
+func SecretCRUD(t *testing.T, tss *Server) {
 	siteId := initIntegerFromEnv("TSS_SITE_ID", t)
 	folderId := initIntegerFromEnv("TSS_FOLDER_ID", t)
 	templateId := initIntegerFromEnv("TSS_TEMPLATE_ID", t)
@@ -199,13 +226,26 @@ func TestSecretCRUD(t *testing.T) {
 // of a Secret which uses an SSH key template, that is, a template with extended
 // mappings that support SSH keys. Referred to as "Test #3" in the README.
 func TestSecretCRUDForSSHTemplate(t *testing.T) {
+	t.Run("SecretServer_TestSecretCRUDForSSHTemplate", func(t *testing.T) {
+		tss, err := initServer()
+		if err != nil {
+			t.Error("configuring the Server:", err)
+			return
+		}
+		SecretCRUDForSSHTemplate(t, tss)
+	})
 
-	// Initialize
-	tss, err := initServer()
-	if err != nil {
-		t.Error("configuring the Server:", err)
-		return
-	}
+	t.Run("Platform_TestSecretCRUDForSSHTemplate", func(t *testing.T) {
+		tss, err := initPlatformServer()
+		if err != nil {
+			t.Error("configuring the Platform Server:", err)
+			return
+		}
+		SecretCRUDForSSHTemplate(t, tss)
+	})
+}
+
+func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	siteId := initIntegerFromEnv("TSS_SITE_ID", t)
 	folderId := initIntegerFromEnv("TSS_FOLDER_ID", t)
 	templateId := initIntegerFromEnv("TSS_SSH_KEY_TEMPLATE_ID", t)
@@ -566,11 +606,26 @@ func TestSecretCRUDForSSHTemplate(t *testing.T) {
 
 // TestSearch tests Secret. Referred to as "Test #4" in the README.
 func TestSearch(t *testing.T) {
-	tss, err := initServer()
-	if err != nil {
-		t.Error("configuring the Server:", err)
-		return
-	}
+	t.Run("SecretServer_TestSearch", func(t *testing.T) {
+		tss, err := initServer()
+		if err != nil {
+			t.Error("configuring the Server:", err)
+			return
+		}
+		Search(t, tss)
+	})
+
+	t.Run("Platform_TestSearch", func(t *testing.T) {
+		tss, err := initPlatformServer()
+		if err != nil {
+			t.Error("configuring the Platform Server:", err)
+			return
+		}
+		Search(t, tss)
+	})
+}
+
+func Search(t *testing.T, tss *Server) {
 
 	s, err := tss.Secrets(os.Getenv("TSS_SEARCH_TEXT"), os.Getenv("TSS_SEARCH_FIELD"))
 
@@ -590,11 +645,26 @@ func TestSearch(t *testing.T) {
 
 // TestSearchWithoutField tests Secret. Referred to as "Test #5" in the README.
 func TestSearchWithoutField(t *testing.T) {
-	tss, err := initServer()
-	if err != nil {
-		t.Error("configuring the Server:", err)
-		return
-	}
+	t.Run("SecretServer_TestSearchWithoutField", func(t *testing.T) {
+		tss, err := initServer()
+		if err != nil {
+			t.Error("configuring the Server:", err)
+			return
+		}
+		SearchWithoutField(t, tss)
+	})
+
+	t.Run("Platform_TestSearchWithoutField", func(t *testing.T) {
+		tss, err := initPlatformServer()
+		if err != nil {
+			t.Error("configuring the Platform Server:", err)
+			return
+		}
+		SearchWithoutField(t, tss)
+	})
+}
+
+func SearchWithoutField(t *testing.T, tss *Server) {
 
 	s, err := tss.Secrets(os.Getenv("TSS_SEARCH_TEXT"), "")
 
@@ -627,6 +697,25 @@ func initServer() (*Server, error) {
 			// Expecting either the tenant or URL to be set
 			Tenant:    os.Getenv("TSS_TENANT"),
 			ServerURL: os.Getenv("TSS_SERVER_URL"),
+		}
+	}
+	return New(*config)
+}
+
+func initPlatformServer() (*Server, error) {
+	var config *Configuration
+
+	if cj, err := ioutil.ReadFile("../test_config.json"); err == nil {
+		config = new(Configuration)
+
+		json.Unmarshal(cj, &config)
+	} else {
+		config = &Configuration{
+			Credentials: UserCredential{
+				Username: os.Getenv("TSS_PLATFORM_USERNAME"),
+				Password: os.Getenv("TSS_PLATFORM_PASSWORD"),
+			},
+			ServerURL: os.Getenv("TSS_PLATFORM_URL"),
 		}
 	}
 	return New(*config)
