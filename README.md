@@ -23,7 +23,7 @@ type Configuration struct {
 
 ## Use
 
-Define a `Configuration`, use it to create an instance of `Server`:
+Define a `Configuration`, use it to create an instance of `Server` for Secret Server:
 
 ```golang
 tss := server.New(server.Configuration{
@@ -34,6 +34,20 @@ tss := server.New(server.Configuration{
     // Expecting either the tenant or URL to be set
     Tenant:    os.Getenv("TSS_API_TENANT"),
     ServerURL: os.Getenv("TSS_SERVER_URL"),
+})
+```
+
+OR
+
+Define a `Configuration`, use it to create an instance of `Server` for Platform:
+
+```golang
+tss := server.New(server.Configuration{
+    Credentials: UserCredential{
+        Username: os.Getenv("TSS_PLATFORM_USERNAME"),
+        Password: os.Getenv("TSS_PLATFORM_PASSWORD"),
+    },
+    ServerURL: os.Getenv("TSS_PLATFORM_URL"),
 })
 ```
 
@@ -111,10 +125,13 @@ The necessary configuration may also be configured from environment variables:
 
 | Env Var Name   | Description                                                                                                                              |
 |----------------|------------------------------------------------------------------------------------------------------------------------------------------|
-| TSS_USERNAME   | The user name for the Secret Server/Platform                                                                                                   |
-| TSS_PASSWORD   | The password for the user of Secret Server/Platform                                                                                                               |
+| TSS_USERNAME   | The user name for the Secret Server                                                                                                   |
+| TSS_PASSWORD   | The password for the user of Secret Server                                                                                                           |
 | TSS_TENANT     | Name for tenants hosted in the Secret Server Cloud. This is prepended to the *.secretservercloud.com domain to determine the server URL. |
 | TSS_SERVER_URL | URL for secret servers not hosted in the cloud, eg: https://delinea.mycompany.com/SecretServer or platform URL                                             |
+| TSS_PLATFORM_USERNAME | The user name for the Platform user                                             |
+| TSS_PLATFORM_PASSWORD | The password for the Platform user                                             |
+| TSS_PLATFORM_URL | URL for Platform, eg: https://delinea.secureplatform.com/                                            |
 
 ### Test #1 - Read Secret Password
 Reads the secret with ID `1` or the ID passed in the `TSS_SECRET_ID` environment variable 

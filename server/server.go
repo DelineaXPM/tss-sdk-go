@@ -43,7 +43,7 @@ type Server struct {
 // New returns an initialized Secrets object
 func New(config Configuration) (*Server, error) {
 	if config.ServerURL == "" && config.Tenant == "" || config.ServerURL != "" && config.Tenant != "" {
-		return nil, fmt.Errorf("either ServerURL or Tenant must be set")
+		return nil, fmt.Errorf("either ServerURL of Secret Server/Platform or Tenant of Secret Server Cloud must be set")
 	}
 	if config.TLD == "" {
 		config.TLD = defaultTLD
