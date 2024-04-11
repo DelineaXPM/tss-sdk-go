@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"mime/multipart"
 	"net/http"
@@ -42,7 +43,7 @@ type Server struct {
 // New returns an initialized Secrets object
 func New(config Configuration) (*Server, error) {
 	if config.ServerURL == "" && config.Tenant == "" || config.ServerURL != "" && config.Tenant != "" {
-		return nil, fmt.Errorf("either ServerURL or Tenant must be set")
+		return nil, fmt.Errorf("either ServerURL of Secret Server/Platform or Tenant of Secret Server Cloud must be set")
 	}
 	if config.TLD == "" {
 		config.TLD = defaultTLD
@@ -134,17 +135,17 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		}
 	}
 
-	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
-
-	if err != nil {
-		log.Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
-		return nil, err
-	}
-
 	accessToken, err := s.getAccessToken()
 
 	if err != nil {
 		log.Print("[ERROR] error getting accessToken:", err)
+		return nil, err
+	}
+
+	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
+
+	if err != nil {
+		log.Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
 		return nil, err
 	}
 
@@ -178,17 +179,17 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 	method := "GET"
 	body := bytes.NewBuffer([]byte{})
 
-	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
-
-	if err != nil {
-		log.Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
-		return nil, err
-	}
-
 	accessToken, err := s.getAccessToken()
 
 	if err != nil {
 		log.Print("[ERROR] error getting accessToken:", err)
+		return nil, err
+	}
+
+	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
+
+	if err != nil {
+		log.Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
 		return nil, err
 	}
 
@@ -253,38 +254,303 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 
 // getAccessToken gets an OAuth2 Access Grant and returns the token
 // endpoint and get an accessGrant.
-func (s Server) getAccessToken() (string, error) {
+func (s *Server) getAccessToken() (string, error) {
 	if s.Credentials.Token != "" {
 		return s.Credentials.Token, nil
 	}
-	values := url.Values{
-		"username":   {s.Credentials.Username},
-		"password":   {s.Credentials.Password},
-		"grant_type": {"password"},
-	}
-	if s.Credentials.Domain != "" {
-		values["domain"] = []string{s.Credentials.Domain}
-	}
-
-	body := strings.NewReader(values.Encode())
-	requestUrl := s.urlFor("token", "")
-	data, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
-
+	response, err := s.checkPlatformDetails()
 	if err != nil {
-		log.Print("[ERROR] grant response error:", err)
+		log.Print("Error while checking server details:", err)
 		return "", err
+	} else if err == nil && response == "" {
+		values := url.Values{
+			"username":   {s.Credentials.Username},
+			"password":   {s.Credentials.Password},
+			"grant_type": {"password"},
+		}
+		if s.Credentials.Domain != "" {
+			values["domain"] = []string{s.Credentials.Domain}
+		}
+
+		body := strings.NewReader(values.Encode())
+		requestUrl := s.urlFor("token", "")
+		data, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
+
+		if err != nil {
+			log.Print("[ERROR] grant response error:", err)
+			return "", err
+		}
+
+		grant := struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			TokenType    string `json:"token_type"`
+			ExpiresIn    int    `json:"expires_in"`
+		}{}
+
+		if err = json.Unmarshal(data, &grant); err != nil {
+			log.Print("[ERROR] parsing grant response:", err)
+			return "", err
+		}
+		return grant.AccessToken, nil
+	} else {
+		return response, nil
+	}
+}
+
+func (s *Server) checkPlatformDetails() (string, error) {
+	var baseURL string
+
+	if s.ServerURL == "" {
+		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
+	} else {
+		baseURL = s.ServerURL
 	}
 
-	grant := struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		TokenType    string `json:"token_type"`
-		ExpiresIn    int    `json:"expires_in"`
-	}{}
+	platformHelthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "health")
+	ssHealthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "healthcheck.aspx")
 
-	if err = json.Unmarshal(data, &grant); err != nil {
-		log.Print("[ERROR] parsing grant response:", err)
-		return "", err
+	isHealthy := checkJSONResponse(ssHealthCheckUrl)
+	if isHealthy {
+		return "", nil
+	} else {
+		isHealthy := checkJSONResponse(platformHelthCheckUrl)
+		if isHealthy {
+			requestData := map[string]string{
+				"User":    s.Credentials.Username,
+				"Version": "1.0",
+			}
+			jsonData, err := json.Marshal(requestData)
+			if err != nil {
+				log.Print("Error marshaling JSON:", err)
+				return "", err
+			}
+
+			req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/Security/StartAuthentication"), bytes.NewBuffer(jsonData))
+			if err != nil {
+				log.Print("Error creating HTTP request:", err)
+				return "", err
+			}
+
+			data, _, err := handleResponse((&http.Client{}).Do(req))
+			if err != nil {
+				log.Print("[ERROR] start authetication response error:", err)
+				return "", err
+			}
+
+			var startAuthjsonResponse StartAuthResponse
+			if err = json.Unmarshal(data, &startAuthjsonResponse); err != nil {
+				log.Print("[ERROR] parsing start auth response:", err)
+				return "", err
+			}
+
+			requestData = map[string]string{
+				"Answer":      s.Credentials.Password,
+				"MechanismId": findMechanismId(startAuthjsonResponse),
+				"Action":      "Answer",
+				"SessionId":   startAuthjsonResponse.Result.SessionId,
+				"TenantId":    startAuthjsonResponse.Result.TenantId,
+			}
+
+			jsonData, err = json.Marshal(requestData)
+			if err != nil {
+				log.Print("Error marshaling JSON:", err)
+				return "", err
+			}
+
+			req, err = http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/Security/AdvanceAuthentication"), bytes.NewBuffer(jsonData))
+			if err != nil {
+				log.Print("Error creating HTTP request:", err)
+				return "", err
+			}
+
+			data, _, err = handleResponse((&http.Client{}).Do(req))
+			if err != nil {
+				log.Print("[ERROR] advance authetication response error:", err)
+				return "", err
+			}
+
+			var advanceAuthJsonResponse AdvanceAuthResponse
+			if err = json.Unmarshal(data, &advanceAuthJsonResponse); err != nil {
+				log.Print("[ERROR] parsing advance auth response:", err)
+				return "", err
+			}
+
+			req, err = http.NewRequest("GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
+			if err != nil {
+				log.Print("Error creating HTTP request:", err)
+				return "", err
+			}
+			req.Header.Add("Authorization", "Bearer "+advanceAuthJsonResponse.Result.OAuthTokens.AccessToken)
+
+			data, _, err = handleResponse((&http.Client{}).Do(req))
+			if err != nil {
+				log.Print("[ERROR] get vaults response error:", err)
+				return "", err
+			}
+
+			var vaultJsonResponse VaultsResponseModel
+			if err = json.Unmarshal(data, &vaultJsonResponse); err != nil {
+				log.Print("[ERROR] parsing vaults response:", err)
+				return "", err
+			}
+
+			var vaultURL string
+			for _, vault := range vaultJsonResponse.Vaults {
+				if vault.IsDefault && vault.IsActive {
+					vaultURL = vault.Connection.Url
+					break
+				}
+			}
+			if vaultURL != "" {
+				s.ServerURL = vaultURL
+			} else {
+				return "", fmt.Errorf("no configured vault found")
+			}
+
+			return advanceAuthJsonResponse.Result.OAuthTokens.AccessToken, nil
+		}
 	}
-	return grant.AccessToken, nil
+	return "", fmt.Errorf("invalid URL")
+}
+
+func checkJSONResponse(url string) bool {
+	response, err := http.Get(url)
+	if err != nil {
+		log.Println("Error making GET request:", err)
+		return false
+	}
+	defer response.Body.Close()
+
+	body, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		log.Println("Error reading response body:", err)
+		return false
+	}
+
+	var jsonResponse Response
+	err = json.Unmarshal(body, &jsonResponse)
+	if err == nil {
+		return jsonResponse.Healthy
+	} else {
+		return strings.Contains(string(body), "Healthy")
+	}
+}
+
+func findMechanismId(saResponse StartAuthResponse) string {
+	for _, challenge := range saResponse.Result.Challenges {
+		for _, mechanism := range challenge.Mechanisms {
+			if mechanism.PromptSelectMech == "Password" {
+				return mechanism.MechanismId
+			}
+		}
+	}
+	return ""
+}
+
+type Response struct {
+	Healthy               bool `json:"healthy"`
+	DatabaseHealthy       bool `json:"databaseHealthy"`
+	ServiceBusHealthy     bool `json:"serviceBusHealthy"`
+	StorageAccountHealthy bool `json:"storageAccountHealthy"`
+	ScheduledForDeletion  bool `json:"scheduledForDeletion"`
+}
+
+type ClientHints struct {
+	PersistDefault      bool   `json:"PersistDefault"`
+	AllowPersist        bool   `json:"AllowPersist"`
+	AllowForgotPassword bool   `json:"AllowForgotPassword"`
+	StartingPoint       string `json:"StartingPoint"`
+	RequestedUsername   string `json:"RequestedUsername"`
+}
+
+type Mechanism struct {
+	AnswerType       string `json:"AnswerType"`
+	Name             string `json:"Name"`
+	PromptMechChosen string `json:"PromptMechChosen"`
+	PromptSelectMech string `json:"PromptSelectMech"`
+	MechanismId      string `json:"MechanismId"`
+}
+
+type Challenge struct {
+	Mechanisms []Mechanism `json:"Mechanisms"`
+}
+
+type Result struct {
+	ClientHints        ClientHints `json:"ClientHints"`
+	Version            string      `json:"Version"`
+	SessionId          string      `json:"SessionId"`
+	AllowLoginMfaCache bool        `json:"AllowLoginMfaCache"`
+	Challenges         []Challenge `json:"Challenges"`
+	Summary            string      `json:"Summary"`
+	TenantId           string      `json:"TenantId"`
+}
+
+type StartAuthResponse struct {
+	Success         bool        `json:"success"`
+	Result          Result      `json:"Result"`
+	Message         interface{} `json:"Message"`
+	MessageID       interface{} `json:"MessageID"`
+	Exception       interface{} `json:"Exception"`
+	ErrorID         interface{} `json:"ErrorID"`
+	ErrorCode       interface{} `json:"ErrorCode"`
+	IsSoftError     bool        `json:"IsSoftError"`
+	InnerExceptions interface{} `json:"InnerExceptions"`
+}
+
+type OAuthTokens struct {
+	AccessToken      string `json:"access_token"`
+	RefreshToken     string `json:"refresh_token"`
+	IdToken          string `json:"id_token"`
+	TokenType        string `json:"token_type"`
+	ExpiresIn        int    `json:"expires_in"`
+	SessionExpiresIn int    `json:"session_expires_in"`
+	Scope            string `json:"scope"`
+}
+
+type AdvanceAuthResult struct {
+	AuthLevel     string      `json:"AuthLevel"`
+	DisplayName   string      `json:"DisplayName"`
+	OAuthTokens   OAuthTokens `json:"OAuthTokens"`
+	UserId        string      `json:"UserId"`
+	EmailAddress  string      `json:"EmailAddress"`
+	UserDirectory string      `json:"UserDirectory"`
+	StartingPoint string      `json:"StartingPoint"`
+	PodFqdn       string      `json:"PodFqdn"`
+	User          string      `json:"User"`
+	CustomerID    string      `json:"CustomerID"`
+	SystemID      string      `json:"SystemID"`
+	SourceDsType  string      `json:"SourceDsType"`
+	Summary       string      `json:"Summary"`
+}
+
+type AdvanceAuthResponse struct {
+	Success         bool              `json:"success"`
+	Result          AdvanceAuthResult `json:"Result"`
+	Message         interface{}       `json:"Message"`
+	MessageID       interface{}       `json:"MessageID"`
+	Exception       interface{}       `json:"Exception"`
+	ErrorID         interface{}       `json:"ErrorID"`
+	ErrorCode       interface{}       `json:"ErrorCode"`
+	IsSoftError     bool              `json:"IsSoftError"`
+	InnerExceptions interface{}       `json:"InnerExceptions"`
+}
+
+type Connection struct {
+	Url            string `json:"url"`
+	OAuthProfileId string `json:"oAuthProfileId"`
+}
+
+type Vault struct {
+	VaultId         string     `json:"vaultId"`
+	Name            string     `json:"name"`
+	Type            string     `json:"type"`
+	IsDefault       bool       `json:"isDefault"`
+	IsGlobalDefault bool       `json:"isGlobalDefault"`
+	IsActive        bool       `json:"isActive"`
+	Connection      Connection `json:"connection"`
+}
+
+type VaultsResponseModel struct {
+	Vaults []Vault `json:"vaults"`
 }
