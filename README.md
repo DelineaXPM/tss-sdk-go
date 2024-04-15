@@ -1,6 +1,6 @@
 # The Delinea Secret Server SDK for Go
 
-![Tests](https://github.com/DelineaXPM/tss-sdk-go/workflows/Tests/badge.svg)
+[![Tests](https://github.com/DelineaXPM/tss-sdk-go/actions/workflows/tests.yml/badge.svg)](https://github.com/DelineaXPM/tss-sdk-go/actions/workflows/tests.yml)
 
 A Golang API and examples for [Delinea](https://delinea.com/)
 [Secret Server](https://delinea.com/products/secret-server/).
