@@ -25,7 +25,7 @@ func TestSecretTemplate(t *testing.T) {
 		return
 	}
 
-	if template == nil {
+	if template == nil || template.Fields == nil {
 		t.Error("secret data is nil")
 	}
 

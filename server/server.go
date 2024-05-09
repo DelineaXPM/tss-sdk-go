@@ -16,7 +16,7 @@ import (
 
 const (
 	cloudBaseURLTemplate string = "https://%s.secretservercloud.%s/"
-	defaultAPIPathURI    string = "/api/v1"
+	defaultAPIPathURI    string = "/api/"
 	defaultTokenPathURI  string = "/oauth2/token"
 	defaultTLD           string = "com"
 )
@@ -29,9 +29,9 @@ type UserCredential struct {
 
 // Configuration settings for the API
 type Configuration struct {
-	Credentials                                      UserCredential
-	ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
-	TLSClientConfig                                  *tls.Config
+	Credentials                                                  UserCredential
+	ServerURL, TLD, Tenant, apiPathURI, apiVersion, tokenPathURI string
+	TLSClientConfig                                              *tls.Config
 }
 
 // Server provides access to secrets stored in Delinea Secret Server
@@ -77,9 +77,10 @@ func (s Server) urlFor(resource, path string) string {
 			strings.Trim(baseURL, "/"),
 			strings.Trim(s.tokenPathURI, "/"))
 	default:
-		return fmt.Sprintf("%s/%s/%s/%s",
+		return fmt.Sprintf("%s/%s/%s/%s/%s",
 			strings.Trim(baseURL, "/"),
 			strings.Trim(s.apiPathURI, "/"),
+			strings.Trim(s.apiVersion, "/"),
 			strings.Trim(resource, "/"),
 			strings.Trim(path, "/"))
 	}
@@ -95,9 +96,10 @@ func (s Server) urlForSearch(resource, searchText, fieldName string) string {
 	}
 	switch {
 	case resource == "secrets":
-		url := fmt.Sprintf("%s/%s/%s?paging.filter.searchText=%s&paging.filter.searchField=%s&paging.filter.doNotCalculateTotal=true&paging.take=30&&paging.skip=0",
+		url := fmt.Sprintf("%s/%s/%s/%s?paging.filter.searchText=%s&paging.filter.searchField=%s&paging.filter.doNotCalculateTotal=true&paging.take=30&&paging.skip=0",
 			strings.Trim(baseURL, "/"),
 			strings.Trim(s.apiPathURI, "/"),
+			strings.Trim(s.apiVersion, "/"),
 			strings.Trim(resource, "/"),
 			searchText,
 			fieldName)
@@ -112,7 +114,7 @@ func (s Server) urlForSearch(resource, searchText, fieldName string) string {
 
 // accessResource uses the accessToken to access the API resource.
 // It assumes an appropriate combination of method, resource, path and input.
-func (s Server) accessResource(method, resource, path string, input interface{}) ([]byte, error) {
+func (s Server) accessResource(method, resource, path, version string, input interface{}) ([]byte, error) {
 	switch resource {
 	case "secrets":
 	case "secret-templates":
@@ -134,6 +136,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		}
 	}
 
+	s.apiVersion = version
 	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
 
 	if err != nil {
@@ -165,7 +168,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 // searchResources uses the accessToken to search for API resources.
 // It assumes an appropriate combination of resource, search text.
 // field is optional
-func (s Server) searchResources(resource, searchText, field string) ([]byte, error) {
+func (s Server) searchResources(resource, searchText, field, apiVersion string) ([]byte, error) {
 	switch resource {
 	case "secrets":
 	default:
@@ -178,6 +181,7 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 	method := "GET"
 	body := bytes.NewBuffer([]byte{})
 
+	s.apiVersion = apiVersion
 	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
 
 	if err != nil {
@@ -238,6 +242,7 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 		return err
 	}
 
+	s.apiVersion = "v1/"
 	// Make the request
 	req, err := http.NewRequest("PUT", s.urlFor(resource, path), body)
 	if err != nil {
@@ -262,6 +267,8 @@ func (s Server) getAccessToken() (string, error) {
 	if s.Credentials.Domain != "" {
 		values["domain"] = []string{s.Credentials.Domain}
 	}
+
+	s.apiVersion = "v2/"
 
 	body := strings.NewReader(values.Encode())
 	requestUrl := s.urlFor("token", "")

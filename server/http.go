@@ -2,7 +2,7 @@ package server
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 )
 
@@ -14,7 +14,7 @@ func handleResponse(res *http.Response, err error) ([]byte, *http.Response, erro
 		return nil, res, err
 	}
 
-	data, err := ioutil.ReadAll(res.Body)
+	data, err := io.ReadAll(res.Body)
 
 	if err != nil {
 		return nil, res, err

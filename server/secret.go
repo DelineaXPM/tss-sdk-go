@@ -50,7 +50,7 @@ type SshKeyArgs struct {
 func (s Server) Secret(id int) (*Secret, error) {
 	secret := new(Secret)
 
-	if data, err := s.accessResource("GET", resource, strconv.Itoa(id), nil); err == nil {
+	if data, err := s.accessResource("GET", resource, strconv.Itoa(id), "v2/", nil); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
 			log.Printf("[ERROR] error parsing response from /%s/%d: %q", resource, id, data)
 			return nil, err
@@ -65,7 +65,7 @@ func (s Server) Secret(id int) (*Secret, error) {
 		if element.IsFile && element.FileAttachmentID != 0 && element.Filename != "" {
 			path := fmt.Sprintf("%d/fields/%s", id, element.Slug)
 
-			if data, err := s.accessResource("GET", resource, path, nil); err == nil {
+			if data, err := s.accessResource("GET", resource, path, "v1/", nil); err == nil {
 				secret.Fields[index].ItemValue = string(data)
 			} else {
 				return nil, err
@@ -79,7 +79,7 @@ func (s Server) Secret(id int) (*Secret, error) {
 // Secret gets the secret with id from the Secret Server of the given tenant
 func (s Server) Secrets(searchText, field string) ([]Secret, error) {
 	searchResult := new(SearchResult)
-	if data, err := s.searchResources(resource, searchText, field); err == nil {
+	if data, err := s.searchResources(resource, searchText, field, "v1/"); err == nil {
 		if err = json.Unmarshal(data, searchResult); err != nil {
 			log.Printf("[ERROR] error parsing response from /%s/%s: %q", resource, searchText, data)
 			return nil, err
@@ -135,8 +135,9 @@ func (s Server) writeSecret(secret Secret, method string, path string) (*Secret,
 	// This SDK does support secret templates that accept both kinds
 	// of file fields.
 	fileFields := make([]SecretField, 0)
-	generalFields := make([]SecretField, 0)
 	if secret.SshKeyArgs == nil || !secret.SshKeyArgs.GenerateSshKeys {
+		//nolint: ineffassign
+		var generalFields = make([]SecretField, 0)
 		fileFields, generalFields, err = secret.separateFileFields(template)
 		if err != nil {
 			return nil, err
@@ -162,7 +163,7 @@ func (s Server) writeSecret(secret Secret, method string, path string) (*Secret,
 		secret.Fields = make([]SecretField, 0)
 	}
 
-	if data, err := s.accessResource(method, resource, path, secret); err == nil {
+	if data, err := s.accessResource(method, resource, path, "v1/", secret); err == nil {
 		if err = json.Unmarshal(data, writtenSecret); err != nil {
 			log.Printf("[ERROR] error parsing response from /%s: %q", resource, data)
 			return nil, err
@@ -179,7 +180,7 @@ func (s Server) writeSecret(secret Secret, method string, path string) (*Secret,
 }
 
 func (s Server) DeleteSecret(id int) error {
-	_, err := s.accessResource("DELETE", resource, strconv.Itoa(id), nil)
+	_, err := s.accessResource("DELETE", resource, strconv.Itoa(id), "v1/", nil)
 	return err
 }
 
@@ -231,7 +232,7 @@ func (s Server) updateFiles(secretId int, fileFields []SecretField) error {
 		if element.ItemValue == "" {
 			path = fmt.Sprintf("%d/general", secretId)
 			input = secretPatch{Data: fieldMods{SecretFields: []fieldMod{{Slug: element.Slug, Dirty: true, Value: nil}}}}
-			if _, err := s.accessResource("PATCH", resource, path, input); err != nil {
+			if _, err := s.accessResource("PATCH", resource, path, "v2/", input); err != nil {
 				return err
 			}
 		} else {

@@ -28,7 +28,7 @@ type SecretTemplateField struct {
 func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
 	secretTemplate := new(SecretTemplate)
 
-	if data, err := s.accessResource("GET", templateResource, strconv.Itoa(id), nil); err == nil {
+	if data, err := s.accessResource("GET", templateResource, strconv.Itoa(id), "v1/", nil); err == nil {
 		if err = json.Unmarshal(data, secretTemplate); err != nil {
 			log.Printf("[ERROR] error parsing response from /%s/%d: %q", templateResource, id, data)
 			return nil, err
@@ -52,7 +52,7 @@ func (s Server) GeneratePassword(slug string, template *SecretTemplate) (string,
 	}
 	path := fmt.Sprintf("generate-password/%d", fieldId)
 
-	if data, err := s.accessResource("POST", templateResource, path, nil); err == nil {
+	if data, err := s.accessResource("POST", templateResource, path, "v1/", nil); err == nil {
 		passwordWithQuotes := string(data)
 		return passwordWithQuotes[1 : len(passwordWithQuotes)-1], nil
 	} else {

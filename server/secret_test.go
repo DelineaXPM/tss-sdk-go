@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strconv"
@@ -29,16 +28,17 @@ func TestSecret(t *testing.T) {
 		return
 	}
 
-	if s == nil {
+	if s != nil {
+		if _, ok := s.Field("password"); !ok {
+			t.Error("no password field")
+		}
+
+		if _, ok := s.Field("nonexistent"); ok {
+			t.Error("s.Field says nonexistent field exists")
+		}
+	} else {
 		t.Error("secret data is nil")
-	}
-
-	if _, ok := s.Field("password"); !ok {
-		t.Error("no password field")
-	}
-
-	if _, ok := s.Field("nonexistent"); ok {
-		t.Error("s.Field says nonexistent field exists")
+		return
 	}
 }
 
@@ -63,6 +63,8 @@ func TestSecretCRUD(t *testing.T) {
 	}
 
 	fieldId := -1
+	fieldIdUserName := -1
+	fieldIdMachineName := -1
 	if siteId < 0 || folderId < 0 || templateId < 0 {
 		return
 	}
@@ -78,6 +80,12 @@ func TestSecretCRUD(t *testing.T) {
 			fieldId = field.SecretTemplateFieldID
 			break
 		}
+		if field.DisplayName == "Machine" {
+			fieldIdMachineName = field.SecretTemplateFieldID
+		}
+		if field.DisplayName == "Username" {
+			fieldIdUserName = field.SecretTemplateFieldID
+		}
 	}
 	if fieldId < 0 {
 		t.Errorf("Unable to find a password field on the secret template with the given id '%d'", templateId)
@@ -86,15 +94,21 @@ func TestSecretCRUD(t *testing.T) {
 	t.Logf("Using field ID '%d' for the password field on the template with ID '%d'", fieldId, templateId)
 
 	// Test creation of a new secret
-	refSecret := new(Secret)
 	password := testPassword
-	refSecret.Name = "Test Secret"
+	refSecret := new(Secret)
+	refSecret.Name = "Secret Server Unit Test"
 	refSecret.SiteID = siteId
 	refSecret.FolderID = folderId
 	refSecret.SecretTemplateID = templateId
-	refSecret.Fields = make([]SecretField, 1)
-	refSecret.Fields[0].FieldID = fieldId
+	refSecret.AutoChangeEnabled = false
+	refSecret.Fields = make([]SecretField, 3)
+	refSecret.Fields[0].FieldID = fieldId // password
 	refSecret.Fields[0].ItemValue = password
+	refSecret.Fields[1].FieldID = fieldIdMachineName // machine
+	refSecret.Fields[1].ItemValue = "SS Test"
+	refSecret.Fields[2].FieldID = fieldIdUserName // username
+	refSecret.Fields[2].ItemValue = "ss_test_username"
+
 	sc, err := tss.CreateSecret(*refSecret)
 	if err != nil {
 		t.Error("calling server.CreateSecret:", err)
@@ -184,14 +198,14 @@ func TestSecretCRUD(t *testing.T) {
 	// Test the deletion of the new secret
 	err = tss.DeleteSecret(sc.ID)
 	if err != nil {
-		t.Error("calling server.DeleteSecret:", err)
+		t.Error("error calling server.DeleteSecret:", err)
 		return
 	}
 
 	// Test read of the deleted secret fails
 	s, err := tss.Secret(sc.ID)
-	if s != nil {
-		t.Errorf("deleted secret with id '%d' returned from read", sc.ID)
+	if s.Active || err != nil {
+		t.Errorf("deleted secret with id '%d' returned from read. S = %+v", sc.ID, s)
 	}
 }
 
@@ -559,8 +573,8 @@ func TestSecretCRUDForSSHTemplate(t *testing.T) {
 
 	// Test read of the deleted secret fails
 	s, err := tss.Secret(sc.ID)
-	if s != nil {
-		t.Errorf("deleted secret with id '%d' returned from read", sc.ID)
+	if s.Active || err != nil {
+		t.Errorf("deleted secret with id '%d' returned from read. error = %+v", sc.ID, err)
 	}
 }
 
@@ -614,10 +628,10 @@ func TestSearchWithoutField(t *testing.T) {
 func initServer() (*Server, error) {
 	var config *Configuration
 
-	if cj, err := ioutil.ReadFile("../test_config.json"); err == nil {
+	if cj, err := os.ReadFile("../test_config.json"); err == nil {
 		config = new(Configuration)
 
-		json.Unmarshal(cj, &config)
+		_ = json.Unmarshal(cj, &config)
 	} else {
 		config = &Configuration{
 			Credentials: UserCredential{
