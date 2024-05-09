@@ -152,7 +152,7 @@ func (s Server) accessResource(method, resource, path, version string, input int
 		return nil, err
 	}
 
-	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
+	req, err = http.NewRequest(method, s.urlFor(resource, path), body)
 
 	if err != nil {
 		log.Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
@@ -204,7 +204,7 @@ func (s Server) searchResources(resource, searchText, field, apiVersion string) 
 		return nil, err
 	}
 
-	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
+	req, err = http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
 
 	if err != nil {
 		log.Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
@@ -285,7 +285,7 @@ func (s *Server) getAccessToken() (string, error) {
 
 	body := strings.NewReader(values.Encode())
 	requestUrl := s.urlFor("token", "")
-	data, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
+	_, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
 
 	response, err := s.checkPlatformDetails()
 
