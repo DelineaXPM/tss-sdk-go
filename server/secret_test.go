@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io/ioutil"
 	"os"
 	"regexp"
 	"strconv"
@@ -698,7 +699,7 @@ func SearchWithoutField(t *testing.T, tss *Server) {
 func initServer() (*Server, error) {
 	var config *Configuration
 
-	if cj, err := os.ReadFile("../test_config.json"); err == nil {
+	if cj, err := ioutil.ReadFile("../test_config.json"); err == nil {
 		config = new(Configuration)
 
 		_ = json.Unmarshal(cj, &config)
@@ -719,7 +720,7 @@ func initServer() (*Server, error) {
 func initPlatformServer() (*Server, error) {
 	var config *Configuration
 
-	if cj, err := os.ReadFile("../test_config.json"); err == nil {
+	if cj, err := ioutil.ReadFile("../test_config.json"); err == nil {
 		config = new(Configuration)
 
 		err := json.Unmarshal(cj, &config)
