@@ -30,4 +30,4 @@
 test_config.json
 
 .DS_Store
-bh_test.go
+bh_example.go

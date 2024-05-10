@@ -38,7 +38,7 @@ func GetSecret(t *testing.T, tss *Server) {
 	s, err := tss.Secret(id)
 
 	if err != nil {
-		t.Error("calling server.Secret:", err)
+		t.Errorf("calling server.Secret: err = %+v, config = %+v, secretID = %d", err, tss, id)
 		return
 	}
 
@@ -231,13 +231,8 @@ func SecretCRUD(t *testing.T, tss *Server) {
 
 	// Test read of the deleted secret fails
 	s, err := tss.Secret(sc.ID)
-<<<<<<< HEAD
-	if s.Active || err != nil {
-		t.Errorf("deleted secret with id '%d' returned from read. S = %+v", sc.ID, s)
-=======
-	if s != nil && s.Active {
-		t.Errorf("deleted secret with id '%d' returned from read", sc.ID)
->>>>>>> main
+	if s != nil && s.Active || err != nil {
+		t.Errorf("deleted secret with id '%d' returned from read, err = %+v", sc.ID, err)
 	}
 }
 
@@ -618,13 +613,8 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 
 	// Test read of the deleted secret fails
 	s, err := tss.Secret(sc.ID)
-<<<<<<< HEAD
-	if s.Active || err != nil {
-		t.Errorf("deleted secret with id '%d' returned from read. error = %+v", sc.ID, err)
-=======
-	if s != nil && s.Active {
-		t.Errorf("deleted secret with id '%d' returned from read", sc.ID)
->>>>>>> main
+	if s != nil && s.Active || err != nil {
+		t.Errorf("deleted secret with id '%d' returned from read. err = %+v", sc.ID, err)
 	}
 }
 
@@ -729,10 +719,13 @@ func initServer() (*Server, error) {
 func initPlatformServer() (*Server, error) {
 	var config *Configuration
 
-	if cj, err := ioutil.ReadFile("../test_config.json"); err == nil {
+	if cj, err := os.ReadFile("../test_config.json"); err == nil {
 		config = new(Configuration)
 
-		json.Unmarshal(cj, &config)
+		err := json.Unmarshal(cj, &config)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		config = &Configuration{
 			Credentials: UserCredential{

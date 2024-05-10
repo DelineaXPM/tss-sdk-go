@@ -137,23 +137,14 @@ func (s Server) accessResource(method, resource, path, version string, input int
 		}
 	}
 
-	s.apiVersion = version
-	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
-
-	if err != nil {
-		log.Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
-		return nil, err
-	}
-
 	accessToken, err := s.getAccessToken()
-
 	if err != nil {
 		log.Print("[ERROR] error getting accessToken:", err)
 		return nil, err
 	}
 
-	req, err = http.NewRequest(method, s.urlFor(resource, path), body)
-
+	s.apiVersion = version
+	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
 	if err != nil {
 		log.Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
 		return nil, err
@@ -186,17 +177,6 @@ func (s Server) searchResources(resource, searchText, field, apiVersion string) 
 		return nil, fmt.Errorf(message)
 	}
 
-	method := "GET"
-	body := bytes.NewBuffer([]byte{})
-
-	s.apiVersion = apiVersion
-	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
-
-	if err != nil {
-		log.Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
-		return nil, err
-	}
-
 	accessToken, err := s.getAccessToken()
 
 	if err != nil {
@@ -204,7 +184,10 @@ func (s Server) searchResources(resource, searchText, field, apiVersion string) 
 		return nil, err
 	}
 
-	req, err = http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
+	method := "GET"
+	body := bytes.NewBuffer([]byte{})
+	s.apiVersion = apiVersion
+	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
 
 	if err != nil {
 		log.Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
@@ -277,18 +260,7 @@ func (s *Server) getAccessToken() (string, error) {
 	if s.Credentials.Token != "" {
 		return s.Credentials.Token, nil
 	}
-	if s.Credentials.Domain != "" {
-		values["domain"] = []string{s.Credentials.Domain}
-	}
-
-	s.apiVersion = "v2/"
-
-	body := strings.NewReader(values.Encode())
-	requestUrl := s.urlFor("token", "")
-	_, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
-
 	response, err := s.checkPlatformDetails()
-
 	if err != nil {
 		log.Print("Error while checking server details:", err)
 		return "", err
