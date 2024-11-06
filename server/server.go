@@ -8,11 +8,14 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const (
@@ -20,6 +23,7 @@ const (
 	defaultAPIPathURI    string = "/api/v1"
 	defaultTokenPathURI  string = "/oauth2/token"
 	defaultTLD           string = "com"
+	cacheTokenName       string = "access_token"
 )
 
 // UserCredential holds the username and password that the API should use to
@@ -38,6 +42,11 @@ type Configuration struct {
 // Server provides access to secrets stored in Delinea Secret Server
 type Server struct {
 	Configuration
+}
+
+type TokenCache struct {
+	AccessToken string `json:"access_token"`
+	ExpiresIn   int    `json:"expires_in"`
 }
 
 // New returns an initialized Secrets object
@@ -252,12 +261,44 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	return err
 }
 
+func (s *Server) setCacheAccessToken(key, value string, expiresIn int) error {
+
+	cache := TokenCache{}
+	cache.AccessToken = value
+	cache.ExpiresIn = (int(time.Now().Unix()) + expiresIn) - int(math.Floor(float64(expiresIn)*0.9))
+
+	data, _ := json.Marshal(cache)
+	os.Setenv("SS_AT", string(data))
+	return nil
+}
+
+func (s *Server) getCacheAccessToken(key string) (string, bool) {
+	data, ok := os.LookupEnv("SS_AT")
+	if !ok {
+		os.Setenv("SS_AT", "")
+		return "", ok
+	}
+	cache := TokenCache{}
+	if err := json.Unmarshal([]byte(data), &cache); err != nil {
+		return "", false
+	}
+	if time.Now().Unix() < int64(cache.ExpiresIn) {
+		return cache.AccessToken, true
+	}
+	return "", false
+}
+
 // getAccessToken gets an OAuth2 Access Grant and returns the token
 // endpoint and get an accessGrant.
 func (s *Server) getAccessToken() (string, error) {
 	if s.Credentials.Token != "" {
 		return s.Credentials.Token, nil
 	}
+	accessToken, found := s.getCacheAccessToken(cacheTokenName)
+	if found {
+		return accessToken, nil
+	}
+
 	response, err := s.checkPlatformDetails()
 	if err != nil {
 		log.Print("Error while checking server details:", err)
@@ -292,6 +333,7 @@ func (s *Server) getAccessToken() (string, error) {
 			log.Print("[ERROR] parsing grant response:", err)
 			return "", err
 		}
+		s.setCacheAccessToken(cacheTokenName, grant.AccessToken, grant.ExpiresIn)
 		return grant.AccessToken, nil
 	} else {
 		return response, nil
