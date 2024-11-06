@@ -23,7 +23,6 @@ const (
 	defaultAPIPathURI    string = "/api/v1"
 	defaultTokenPathURI  string = "/oauth2/token"
 	defaultTLD           string = "com"
-	cacheTokenName       string = "access_token"
 )
 
 // UserCredential holds the username and password that the API should use to
@@ -261,7 +260,7 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	return err
 }
 
-func (s *Server) setCacheAccessToken(key, value string, expiresIn int) error {
+func (s *Server) setCacheAccessToken(value string, expiresIn int) error {
 
 	cache := TokenCache{}
 	cache.AccessToken = value
@@ -272,7 +271,7 @@ func (s *Server) setCacheAccessToken(key, value string, expiresIn int) error {
 	return nil
 }
 
-func (s *Server) getCacheAccessToken(key string) (string, bool) {
+func (s *Server) getCacheAccessToken() (string, bool) {
 	data, ok := os.LookupEnv("SS_AT")
 	if !ok {
 		os.Setenv("SS_AT", "")
@@ -294,7 +293,7 @@ func (s *Server) getAccessToken() (string, error) {
 	if s.Credentials.Token != "" {
 		return s.Credentials.Token, nil
 	}
-	accessToken, found := s.getCacheAccessToken(cacheTokenName)
+	accessToken, found := s.getCacheAccessToken()
 	if found {
 		return accessToken, nil
 	}
@@ -333,7 +332,7 @@ func (s *Server) getAccessToken() (string, error) {
 			log.Print("[ERROR] parsing grant response:", err)
 			return "", err
 		}
-		s.setCacheAccessToken(cacheTokenName, grant.AccessToken, grant.ExpiresIn)
+		s.setCacheAccessToken(grant.AccessToken, grant.ExpiresIn)
 		return grant.AccessToken, nil
 	} else {
 		return response, nil
