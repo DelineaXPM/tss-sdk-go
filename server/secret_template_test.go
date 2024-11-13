@@ -7,12 +7,26 @@ import (
 // TestSecretTemplate tests SecretTemplate. Referred to as
 // "Test #6" in the README.
 func TestSecretTemplate(t *testing.T) {
-	tss, err := initServer()
-	if err != nil {
-		t.Error("configuring the Server:", err)
-		return
-	}
+	t.Run("SecretServer_TestSecretTemplate", func(t *testing.T) {
+		tss, err := initServer()
+		if err != nil {
+			t.Error("configuring the Server:", err)
+			return
+		}
+		VerifySecretTemplate(t, tss)
+	})
 
+	t.Run("Platform_TestSecretTemplate", func(t *testing.T) {
+		tss, err := initPlatformServer()
+		if err != nil {
+			t.Error("configuring the Platform Server:", err)
+			return
+		}
+		VerifySecretTemplate(t, tss)
+	})
+}
+
+func VerifySecretTemplate(t *testing.T, tss *Server) {
 	id := initIntegerFromEnv("TSS_TEMPLATE_ID", t)
 	if id < 0 {
 		return
