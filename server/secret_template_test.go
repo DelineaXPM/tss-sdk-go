@@ -39,7 +39,7 @@ func VerifySecretTemplate(t *testing.T, tss *Server) {
 		return
 	}
 
-	if template == nil {
+	if template == nil || template.Fields == nil {
 		t.Error("secret data is nil")
 	}
 
