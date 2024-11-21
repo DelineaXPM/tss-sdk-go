@@ -261,7 +261,6 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 }
 
 func (s *Server) setCacheAccessToken(value string, expiresIn int) error {
-
 	cache := TokenCache{}
 	cache.AccessToken = value
 	cache.ExpiresIn = (int(time.Now().Unix()) + expiresIn) - int(math.Floor(float64(expiresIn)*0.9))
