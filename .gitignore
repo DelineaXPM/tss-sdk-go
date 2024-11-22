@@ -28,3 +28,4 @@
 .vscode
 .idea
 test_config.json
+.DS_Store
