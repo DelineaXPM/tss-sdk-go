@@ -694,7 +694,7 @@ func TestSecretByPath(t *testing.T) {
 	
 	secret, err := tss.SecretByPath(secretPath)
 	if err != nil {
-	t.Error("Error retrieving secret by path: %v", err)
+	t.Errorf("Error retrieving secret by path: %v", err)
 	}
 	
 	if secret == nil {
