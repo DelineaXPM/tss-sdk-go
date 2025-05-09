@@ -182,3 +182,7 @@ validates that we can generate a password value for every field that is a passwo
 | Env Var Name    | Description                                                                   |
 |-----------------|-------------------------------------------------------------------------------|
 | TSS_TEMPLATE_ID | The numeric ID of the template that defines the secret's fields               |
+
+### Test #7 - Read Secret By Secret-Path
+Reads the secret with Secret-Path passed in the `TSS_SECRET_PATH` environment variable 
+and extracts the Secret fields from it.
