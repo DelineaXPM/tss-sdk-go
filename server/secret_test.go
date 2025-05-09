@@ -682,6 +682,7 @@ func SearchWithoutField(t *testing.T, tss *Server) {
 	}
 }
 
+// TestSecretByPath tests Secret. Referred to as "Test #7" in the README.
 func TestSecretByPath(t *testing.T) {
 	tss, err := initServer()
 		if err != nil {
