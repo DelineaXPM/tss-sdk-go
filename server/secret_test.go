@@ -681,6 +681,38 @@ func SearchWithoutField(t *testing.T, tss *Server) {
 		t.Error("no password field")
 	}
 }
+
+func TestSecretByPath(t *testing.T) {
+	tss, err := initServer()
+		if err != nil {
+			t.Error("configuring the Server:", err)
+			return
+		}
+	
+	secretPath := initStringFromEnv("TSS_SECRET_PATH", t)
+	
+	secret, err := tss.SecretByPath(secretPath)
+	if err != nil {
+	t.Error("Error retrieving secret by path: %v", err)
+	}
+	
+	if secret == nil {
+	t.Error("Expected a secret, got nil")
+	}
+	
+	if secret.Name == "" {
+	t.Error("Secret name is empty")
+	}
+	
+	if secret.ID == 0 {
+	t.Error("Secret ID is zero")
+	}
+	
+	if len(secret.Fields) == 0 {
+	t.Error("Secret fields are empty")
+	}
+}
+
 func initServer() (*Server, error) {
 	var config *Configuration
 
@@ -735,6 +767,16 @@ func initIntegerFromEnv(envVarName string, t *testing.T) int {
 		}
 	}
 	return intValue
+}
+
+// initStringFromEnv reads a string value from the given environment variable.
+// It fails the test if the variable is not set, ensuring the required configuration is present.
+func initStringFromEnv(envVarName string, t *testing.T) string {
+	value := os.Getenv(envVarName)
+	if value == "" {
+		t.Errorf("%s must be set", envVarName)
+	}
+	return value
 }
 
 func validate(label string, expected interface{}, found interface{}, t *testing.T) bool {
