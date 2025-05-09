@@ -684,33 +684,52 @@ func SearchWithoutField(t *testing.T, tss *Server) {
 
 // TestSecretByPath tests Secret. Referred to as "Test #7" in the README.
 func TestSecretByPath(t *testing.T) {
-	tss, err := initServer()
+	t.Run("SecretServer_TestSecretByPath", func(t *testing.T) {
+		tss, err := initServer()
 		if err != nil {
 			t.Error("configuring the Server:", err)
 			return
 		}
-	
+		GetSecretByPath(t, tss)
+	})
+
+	t.Run("Platform_TestSecretByPath", func(t *testing.T) {
+		tss, err := initPlatformServer()
+		if err != nil {
+			t.Error("configuring the Platform Server:", err)
+			return
+		}
+		GetSecretByPath(t, tss)
+	})
+}
+
+func GetSecretByPath(t *testing.T, tss *Server) {
 	secretPath := initStringFromEnv("TSS_SECRET_PATH", t)
-	
+	if secretPath == "" {
+		t.Error("TSS_SECRET_PATH is not set or empty")
+		return
+	}
+
 	secret, err := tss.SecretByPath(secretPath)
 	if err != nil {
-	t.Errorf("Error retrieving secret by path: %v", err)
+		t.Errorf("Error retrieving secret by path: %v", err)
+		return
 	}
-	
+
 	if secret == nil {
-	t.Error("Expected a secret, got nil")
+		t.Error("Expected a secret, got nil")
 	}
-	
+
 	if secret.Name == "" {
-	t.Error("Secret name is empty")
+		t.Error("Secret name is empty")
 	}
-	
+
 	if secret.ID == 0 {
-	t.Error("Secret ID is zero")
+		t.Error("Secret ID is zero")
 	}
-	
+
 	if len(secret.Fields) == 0 {
-	t.Error("Secret fields are empty")
+		t.Error("Secret fields are empty")
 	}
 }
 
