@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"net/url"
 )
 
 // resource is the HTTP URL path component for the secrets resource
