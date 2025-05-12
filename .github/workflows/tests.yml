@@ -20,6 +20,7 @@ env:
   TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
   TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
   TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
+  TSS_SECRET_PATH: ${{ secrets.TSS_SECRET_PATH }}
   TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
   TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
   TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
