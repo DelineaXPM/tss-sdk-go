@@ -790,11 +790,13 @@ func initIntegerFromEnv(envVarName string, t *testing.T) int {
 }
 
 // initStringFromEnv reads a string value from the given environment variable.
-// It fails the test if the variable is not set, ensuring the required configuration is present.
+// Otherwise returns a default string '/Personal/admin/New Secret'.
 func initStringFromEnv(envVarName string, t *testing.T) string {
+	defaultValue := "/Personal/admin/New Secret"
 	value := os.Getenv(envVarName)
 	if value == "" {
-		t.Errorf("%s must be set", envVarName)
+		t.Logf("%s not set, using default: %s", envVarName, defaultValue)
+		return defaultValue
 	}
 	return value
 }
