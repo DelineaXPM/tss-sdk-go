@@ -30,4 +30,13 @@ func main() {
 	if pw, ok := s.Field("password"); ok {
 		fmt.Print("the password is", pw)
 	}
+
+	secretPath := "/Personal/admin/New Secret"
+	secret, err := tss.SecretByPath(secretPath)
+	if err != nil {
+	    log.Fatalf("Failed to retrieve secret by path: %v", err)
+	}
+	
+	fmt.Printf("Secret ID: %d\n", secret.ID)
+	fmt.Printf("Secret Name: %s\n", secret.Name)
 }
