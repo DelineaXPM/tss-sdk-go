@@ -68,16 +68,6 @@ if pw, ok := secret.Field("password"); ok {
 Get a Secret by Path:
 
 ```golang
-tss, err := server.New(server.Config{
-    Tenant:   "your-tenant",
-    Username: "your-username",
-    Password: "your-password",
-    Domain:   "your-domain",
-})
-if err != nil {
-    log.Fatalf("Failed to create server: %v", err)
-}
-
 secretPath := "/Secret-Folder/Secret-Name"
 secret, err := tss.SecretByPath(secretPath)
 if err != nil {
