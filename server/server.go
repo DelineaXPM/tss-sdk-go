@@ -446,7 +446,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 				return "", fmt.Errorf("no configured vault found")
 			}
 
-			return "", nil
+			return accessToken, nil
 		}
 	}
 	return "", fmt.Errorf("invalid URL")
