@@ -370,7 +370,7 @@ func (s *Server) getAccessToken() (string, error) {
 
 func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 	platformHelthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "health")
-	ssHealthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "healthcheck.aspx")
+	ssHealthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "api/v1/healthcheck")
 
 	isHealthy := checkJSONResponse(ssHealthCheckUrl)
 	if isHealthy {
