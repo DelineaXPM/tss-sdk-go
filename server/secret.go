@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"net/url"
 )
 
 // resource is the HTTP URL path component for the secrets resource
@@ -100,6 +101,39 @@ func (s Server) Secrets(searchText, field string) ([]Secret, error) {
 	}
 
 	return secrets, nil
+}
+
+func (s Server) SecretByPath(secretPath string) (*Secret, error) {
+	secret := new(Secret)
+	// Encode the secret path to be safe for URLs
+	encodedPath := url.QueryEscape(secretPath)
+	queryPath := fmt.Sprintf("0?secretPath=%s", encodedPath)
+
+	// Perform the GET request to the 'secrets' resource with the specified path
+	if data, err := s.accessResource("GET", resource, queryPath, nil); err == nil {
+		if err = json.Unmarshal(data, secret); err != nil {
+			log.Printf("[ERROR] error parsing response from /%s/%s: %q", resource, secretPath, data)
+			return nil, err
+		}
+	} else {
+		return nil, err
+	}
+
+	// automatically download file attachments and substitute them for the
+	// (dummy) ItemValue, to make the process transparent to the caller
+	for index, element := range secret.Fields {
+		if element.IsFile && element.FileAttachmentID != 0 && element.Filename != "" {
+			path := fmt.Sprintf("%d/fields/%s", secret.ID, element.Slug)
+
+			if data, err := s.accessResource("GET", resource, path, nil); err == nil {
+				secret.Fields[index].ItemValue = string(data)
+			} else {
+				return nil, err
+			}
+		}
+	}
+
+	return secret, nil
 }
 
 func (s Server) CreateSecret(secret Secret) (*Secret, error) {

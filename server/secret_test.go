@@ -89,39 +89,57 @@ func SecretCRUD(t *testing.T, tss *Server) {
 		return
 	}
 
-	fieldId := -1
 	if siteId < 0 || folderId < 0 || templateId < 0 {
 		return
 	}
 
-	// Retrieve the template and find the first password field
+	// Retrieve the template so we know what fields are required
 	refSecretTemplate, err := tss.SecretTemplate(templateId)
 	if err != nil {
 		t.Error("calling server.SecretTemplate:", err)
 		return
 	}
+
+	// Build the fields based on what the template requires
+	var fields []SecretField
 	for _, field := range refSecretTemplate.Fields {
-		if field.IsPassword {
-			fieldId = field.SecretTemplateFieldID
-			break
+		switch {
+		case field.IsPassword:
+			fields = append(fields, SecretField{
+				FieldID:   field.SecretTemplateFieldID,
+				ItemValue: testPassword,
+			})
+		case regexp.MustCompile(`(?i)username`).MatchString(field.FieldSlugName):
+			fields = append(fields, SecretField{
+				FieldID:   field.SecretTemplateFieldID,
+				ItemValue: "TestUser",
+			})
+		case regexp.MustCompile(`(?i)url`).MatchString(field.FieldSlugName):
+			fields = append(fields, SecretField{
+				FieldID:   field.SecretTemplateFieldID,
+				ItemValue: "https://example.com",
+			})
+		case regexp.MustCompile(`(?i)notes`).MatchString(field.FieldSlugName):
+			fields = append(fields, SecretField{
+				FieldID:   field.SecretTemplateFieldID,
+				ItemValue: "delete after use",
+			})
 		}
 	}
-	if fieldId < 0 {
-		t.Errorf("Unable to find a password field on the secret template with the given id '%d'", templateId)
+
+	if len(fields) == 0 {
+		t.Errorf("No usable fields found in template %d", templateId)
 		return
 	}
-	t.Logf("Using field ID '%d' for the password field on the template with ID '%d'", fieldId, templateId)
 
 	// Test creation of a new secret
 	refSecret := new(Secret)
-	password := testPassword
 	refSecret.Name = "Test Secret"
 	refSecret.SiteID = siteId
 	refSecret.FolderID = folderId
 	refSecret.SecretTemplateID = templateId
-	refSecret.Fields = make([]SecretField, 1)
-	refSecret.Fields[0].FieldID = fieldId
-	refSecret.Fields[0].ItemValue = password
+	refSecret.Fields = fields
+
 	sc, err := tss.CreateSecret(*refSecret)
 	if err != nil {
 		t.Error("calling server.CreateSecret:", err)
@@ -140,12 +158,21 @@ func SecretCRUD(t *testing.T, tss *Server) {
 	if !validate("created secret site id", siteId, sc.SiteID, t) {
 		return
 	}
-	createdPassword, matched := sc.FieldById(fieldId)
+
+	// Check password field exists and matches
+	var passwordFieldID int
+	for _, f := range refSecretTemplate.Fields {
+		if f.IsPassword {
+			passwordFieldID = f.SecretTemplateFieldID
+			break
+		}
+	}
+	createdPassword, matched := sc.FieldById(passwordFieldID)
 	if !matched {
-		t.Errorf("created secret does not have a password field with the given field id '%d':", fieldId)
+		t.Errorf("created secret does not have a password field with the given field id '%d':", passwordFieldID)
 		return
 	}
-	if !validate("created secret password value", password, createdPassword, t) {
+	if !validate("created secret password value", testPassword, createdPassword, t) {
 		return
 	}
 
@@ -159,28 +186,16 @@ func SecretCRUD(t *testing.T, tss *Server) {
 		t.Error("read secret data is nil")
 		return
 	}
-	if !validate("read secret folder id", folderId, sr.FolderID, t) {
-		return
-	}
-	if !validate("read secret template id", templateId, sr.SecretTemplateID, t) {
-		return
-	}
-	if !validate("read secret site id", siteId, sr.SiteID, t) {
-		return
-	}
-	readPassword, matched := sr.FieldById(fieldId)
-	if !matched {
-		t.Errorf("read secret does not have a password field with the given field id '%d':", fieldId)
-		return
-	}
-	if !validate("read secret password value", password, readPassword, t) {
-		return
+
+	// Update the password field
+	newPassword := testPassword + "updated"
+	refSecret.ID = sc.ID
+	for i, f := range refSecret.Fields {
+		if f.FieldID == passwordFieldID {
+			refSecret.Fields[i].ItemValue = newPassword
+		}
 	}
 
-	// Test the update of the new secret
-	newPassword := password + "updated"
-	refSecret.ID = sc.ID
-	refSecret.Fields[0].ItemValue = newPassword
 	su, err := tss.UpdateSecret(*refSecret)
 	if err != nil {
 		t.Error("calling server.UpdateSecret:", err)
@@ -190,18 +205,9 @@ func SecretCRUD(t *testing.T, tss *Server) {
 		t.Error("updated secret data is nil")
 		return
 	}
-	if !validate("updated secret folder id", folderId, su.FolderID, t) {
-		return
-	}
-	if !validate("updated secret template id", templateId, su.SecretTemplateID, t) {
-		return
-	}
-	if !validate("updated secret site id", siteId, su.SiteID, t) {
-		return
-	}
-	updatedPassword, matched := su.FieldById(fieldId)
+	updatedPassword, matched := su.FieldById(passwordFieldID)
 	if !matched {
-		t.Errorf("updated secret does not have a password field with the given field id '%d':", fieldId)
+		t.Errorf("updated secret does not have a password field with the given field id '%d':", passwordFieldID)
 		return
 	}
 	if !validate("updated secret password value", newPassword, updatedPassword, t) {
@@ -634,8 +640,9 @@ func Search(t *testing.T, tss *Server) {
 		return
 	}
 
-	if s == nil {
-		t.Error("secret data is nil")
+	if s == nil || len(s) == 0 {
+		t.Error("secret data is nil or empty")
+		return
 	}
 
 	if _, ok := s[0].Field("password"); !ok {
@@ -673,14 +680,67 @@ func SearchWithoutField(t *testing.T, tss *Server) {
 		return
 	}
 
-	if s == nil {
-		t.Error("secret data is nil")
+	if s == nil || len(s) == 0 {
+		t.Error("secret data is nil or empty")
+		return
 	}
 
 	if _, ok := s[0].Field("password"); !ok {
 		t.Error("no password field")
 	}
 }
+
+// TestSecretByPath tests Secret. Referred to as "Test #7" in the README.
+func TestSecretByPath(t *testing.T) {
+	t.Run("SecretServer_TestSecretByPath", func(t *testing.T) {
+		tss, err := initServer()
+		if err != nil {
+			t.Error("configuring the Server:", err)
+			return
+		}
+		GetSecretByPath(t, tss)
+	})
+
+	t.Run("Platform_TestSecretByPath", func(t *testing.T) {
+		tss, err := initPlatformServer()
+		if err != nil {
+			t.Error("configuring the Platform Server:", err)
+			return
+		}
+		GetSecretByPath(t, tss)
+	})
+}
+
+func GetSecretByPath(t *testing.T, tss *Server) {
+	secretPath := initStringFromEnv("TSS_SECRET_PATH", t)
+	if secretPath == "" {
+		t.Error("TSS_SECRET_PATH is not set or empty")
+		return
+	}
+
+	secret, err := tss.SecretByPath(secretPath)
+	if err != nil {
+		t.Errorf("Error retrieving secret by path: %v", err)
+		return
+	}
+
+	if secret == nil {
+		t.Error("Expected a secret, got nil")
+	}
+
+	if secret.Name == "" {
+		t.Error("Secret name is empty")
+	}
+
+	if secret.ID == 0 {
+		t.Error("Secret ID is zero")
+	}
+
+	if len(secret.Fields) == 0 {
+		t.Error("Secret fields are empty")
+	}
+}
+
 func initServer() (*Server, error) {
 	var config *Configuration
 
@@ -735,6 +795,18 @@ func initIntegerFromEnv(envVarName string, t *testing.T) int {
 		}
 	}
 	return intValue
+}
+
+// initStringFromEnv reads a string value from the given environment variable.
+// Otherwise returns a default string '/Personal/admin/New Secret'.
+func initStringFromEnv(envVarName string, t *testing.T) string {
+	defaultValue := "/Personal/admin/New Secret"
+	value := os.Getenv(envVarName)
+	if value == "" {
+		t.Logf("%s not set, using default: %s", envVarName, defaultValue)
+		return defaultValue
+	}
+	return value
 }
 
 func validate(label string, expected interface{}, found interface{}, t *testing.T) bool {

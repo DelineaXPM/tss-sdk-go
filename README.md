@@ -65,6 +65,19 @@ if pw, ok := secret.Field("password"); ok {
 }
 ```
 
+Get a Secret by Path:
+
+```golang
+secretPath := "/Secret-Folder/Secret-Name"
+secret, err := tss.SecretByPath(secretPath)
+if err != nil {
+    log.Fatalf("Failed to retrieve secret by path: %v", err)
+}
+
+fmt.Printf("Secret ID: %d\n", secret.ID)
+fmt.Printf("Secret Name: %s\n", secret.Name)
+```
+
 Create a Secret:
 
 ```golang
@@ -182,3 +195,7 @@ validates that we can generate a password value for every field that is a passwo
 | Env Var Name    | Description                                                                   |
 |-----------------|-------------------------------------------------------------------------------|
 | TSS_TEMPLATE_ID | The numeric ID of the template that defines the secret's fields               |
+
+### Test #7 - Read Secret By Secret-Path
+Reads the secret with Secret-Path passed in the `TSS_SECRET_PATH` environment variable 
+and extracts the Secret fields from it.
