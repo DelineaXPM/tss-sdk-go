@@ -25,7 +25,7 @@ jobs:
       - name: Build
         run: go build -v .
 
-      - uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
+      - uses: actions/upload-artifact@v4 # v4
         with:
           name: artifacts
           path: tss-sdk-go.exe
