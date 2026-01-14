@@ -3,9 +3,8 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"log"
-	"strconv"
 	"net/url"
+	"strconv"
 )
 
 // resource is the HTTP URL path component for the secrets resource
@@ -53,7 +52,7 @@ func (s Server) Secret(id int) (*Secret, error) {
 
 	if data, err := s.accessResource("GET", resource, strconv.Itoa(id), nil); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
-			log.Printf("[ERROR] error parsing response from /%s/%d: %q", resource, id, data)
+			s.log().Printf("[ERROR] error parsing response from /%s/%d: %q", resource, id, data)
 			return nil, err
 		}
 	} else {
@@ -82,7 +81,7 @@ func (s Server) Secrets(searchText, field string) ([]Secret, error) {
 	searchResult := new(SearchResult)
 	if data, err := s.searchResources(resource, searchText, field); err == nil {
 		if err = json.Unmarshal(data, searchResult); err != nil {
-			log.Printf("[ERROR] error parsing response from /%s/%s: %q", resource, searchText, data)
+			s.log().Printf("[ERROR] error parsing response from /%s/%s: %q", resource, searchText, data)
 			return nil, err
 		}
 	} else {
@@ -112,7 +111,7 @@ func (s Server) SecretByPath(secretPath string) (*Secret, error) {
 	// Perform the GET request to the 'secrets' resource with the specified path
 	if data, err := s.accessResource("GET", resource, queryPath, nil); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
-			log.Printf("[ERROR] error parsing response from /%s/%s: %q", resource, secretPath, data)
+			s.log().Printf("[ERROR] error parsing response from /%s/%s: %q", resource, secretPath, data)
 			return nil, err
 		}
 	} else {
@@ -198,7 +197,7 @@ func (s Server) writeSecret(secret Secret, method string, path string) (*Secret,
 
 	if data, err := s.accessResource(method, resource, path, secret); err == nil {
 		if err = json.Unmarshal(data, writtenSecret); err != nil {
-			log.Printf("[ERROR] error parsing response from /%s: %q", resource, data)
+			s.log().Printf("[ERROR] error parsing response from /%s: %q", resource, data)
 			return nil, err
 		}
 	} else {
@@ -221,11 +220,9 @@ func (s Server) DeleteSecret(id int) error {
 func (s Secret) Field(fieldName string) (string, bool) {
 	for _, field := range s.Fields {
 		if fieldName == field.FieldName || fieldName == field.Slug {
-			log.Printf("[DEBUG] field with name '%s' matches '%s'", field.FieldName, fieldName)
 			return field.ItemValue, true
 		}
 	}
-	log.Printf("[DEBUG] no matching field for name '%s' in secret '%s'", fieldName, s.Name)
 	return "", false
 }
 
@@ -233,11 +230,9 @@ func (s Secret) Field(fieldName string) (string, bool) {
 func (s Secret) FieldById(fieldId int) (string, bool) {
 	for _, field := range s.Fields {
 		if fieldId == field.FieldID {
-			log.Printf("[DEBUG] field with name '%s' matches field ID '%d'", field.FieldName, fieldId)
 			return field.ItemValue, true
 		}
 	}
-	log.Printf("[DEBUG] no matching field for ID '%d' in secret '%s'", fieldId, s.Name)
 	return "", false
 }
 

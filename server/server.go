@@ -25,6 +25,42 @@ const (
 	defaultTLD           string = "com"
 )
 
+// Logger is an interface for logging in the SDK. It matches the standard log package interface.
+// Consumers can provide their own implementation to customize logging behavior.
+type Logger interface {
+	Printf(format string, v ...interface{})
+	Print(v ...interface{})
+	Println(v ...interface{})
+}
+
+// DiscardLogger is a Logger implementation that discards all output (no-op).
+// Use this to completely disable logging from the SDK.
+type DiscardLogger struct{}
+
+func (d *DiscardLogger) Printf(format string, v ...interface{}) {}
+func (d *DiscardLogger) Print(v ...interface{})                 {}
+func (d *DiscardLogger) Println(v ...interface{})               {}
+
+// stdLogger wraps the standard log package and implements the Logger interface
+type stdLogger struct{}
+
+func (s *stdLogger) Printf(format string, v ...interface{}) {
+	log.Printf(format, v...)
+}
+
+func (s *stdLogger) Print(v ...interface{}) {
+	log.Print(v...)
+}
+
+func (s *stdLogger) Println(v ...interface{}) {
+	log.Println(v...)
+}
+
+// defaultLoggerInstance is the default logger used when no Logger is configured.
+// Following Go library conventions, logging is disabled by default.
+// To enable logging, set Configuration.Logger to log.Default() or a custom logger.
+var defaultLoggerInstance Logger = &DiscardLogger{}
+
 // UserCredential holds the username and password that the API should use to
 // authenticate to the REST API
 type UserCredential struct {
@@ -36,6 +72,7 @@ type Configuration struct {
 	Credentials                                      UserCredential
 	ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
 	TLSClientConfig                                  *tls.Config
+	Logger                                           Logger
 }
 
 // Server provides access to secrets stored in Delinea Secret Server
@@ -68,6 +105,15 @@ func New(config Configuration) (*Server, error) {
 	}
 	config.tokenPathURI = strings.Trim(config.tokenPathURI, "/")
 	return &Server{config}, nil
+}
+
+// log returns the logger to use for this Server. If no Logger is configured,
+// it returns the default logger that uses the standard log package.
+func (s *Server) log() Logger {
+	if s.Logger != nil {
+		return s.Logger
+	}
+	return defaultLoggerInstance
 }
 
 // urlFor is the URL for the given resource and path
@@ -128,7 +174,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 	default:
 		message := "unknown resource"
 
-		log.Printf("[ERROR] %s: %s", message, resource)
+		s.log().Printf("[ERROR] %s: %s", message, resource)
 		return nil, fmt.Errorf(message)
 	}
 
@@ -138,7 +184,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		if data, err := json.Marshal(input); err == nil {
 			body = bytes.NewBuffer(data)
 		} else {
-			log.Print("[ERROR] marshaling the request body to JSON:", err)
+			s.log().Print("[ERROR] marshaling the request body to JSON:", err)
 			return nil, err
 		}
 	}
@@ -146,14 +192,14 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 	accessToken, err := s.getAccessToken()
 
 	if err != nil {
-		log.Print("[ERROR] error getting accessToken:", err)
+		s.log().Print("[ERROR] error getting accessToken:", err)
 		return nil, err
 	}
 
 	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
 
 	if err != nil {
-		log.Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
+		s.log().Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
 		return nil, err
 	}
 
@@ -164,14 +210,14 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	log.Printf("[DEBUG] calling %s %s", method, req.URL.String())
+	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
 	data, statusCode, err := handleResponse((&http.Client{}).Do(req))
 
 	// Check for unauthorized or access denied
 	if statusCode.StatusCode == http.StatusUnauthorized || statusCode.StatusCode == http.StatusForbidden {
 		s.clearTokenCache()
-		log.Printf("[ERROR] Token cache cleared due to unauthorized or access denied response.")
+		s.log().Printf("[ERROR] Token cache cleared due to unauthorized or access denied response.")
 	}
 
 	return data, err
@@ -186,7 +232,7 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 	default:
 		message := "unknown resource"
 
-		log.Printf("[ERROR] %s: %s", message, resource)
+		s.log().Printf("[ERROR] %s: %s", message, resource)
 		return nil, fmt.Errorf(message)
 	}
 
@@ -196,20 +242,20 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 	accessToken, err := s.getAccessToken()
 
 	if err != nil {
-		log.Print("[ERROR] error getting accessToken:", err)
+		s.log().Print("[ERROR] error getting accessToken:", err)
 		return nil, err
 	}
 
 	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
 
 	if err != nil {
-		log.Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
+		s.log().Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
 		return nil, err
 	}
 
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 
-	log.Printf("[DEBUG] calling %s %s", method, req.URL.String())
+	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
 	data, _, err := handleResponse((&http.Client{}).Do(req))
 
@@ -219,14 +265,14 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 // uploadFile uploads the file described in the given fileField to the
 // secret at the given secretId as a multipart/form-data request.
 func (s Server) uploadFile(secretId int, fileField SecretField) error {
-	log.Printf("[DEBUG] uploading a file to the '%s' field with filename '%s'", fileField.Slug, fileField.Filename)
+	s.log().Printf("[DEBUG] uploading a file to the '%s' field with filename '%s'", fileField.Slug, fileField.Filename)
 	body := bytes.NewBuffer([]byte{})
 	path := fmt.Sprintf("%d/fields/%s", secretId, fileField.Slug)
 
 	// Fetch the access token
 	accessToken, err := s.getAccessToken()
 	if err != nil {
-		log.Print("[ERROR] error getting accessToken:", err)
+		s.log().Print("[ERROR] error getting accessToken:", err)
 		return err
 	}
 
@@ -235,10 +281,10 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	filename := fileField.Filename
 	if filename == "" {
 		filename = "File.txt"
-		log.Printf("[DEBUG] field has no filename, setting its filename to '%s'", filename)
+		s.log().Printf("[DEBUG] field has no filename, setting its filename to '%s'", filename)
 	} else if match, _ := regexp.Match("[^.]+\\.\\w+$", []byte(filename)); !match {
 		filename = filename + ".txt"
-		log.Printf("[DEBUG] field has no filename extension, setting its filename to '%s'", filename)
+		s.log().Printf("[DEBUG] field has no filename extension, setting its filename to '%s'", filename)
 	}
 	form, err := multipartWriter.CreateFormFile("file", filename)
 	if err != nil {
@@ -260,7 +306,7 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	}
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
-	log.Printf("[DEBUG] uploading file with PUT %s", req.URL.String())
+	s.log().Printf("[DEBUG] uploading file with PUT %s", req.URL.String())
 	_, _, err = handleResponse((&http.Client{}).Do(req))
 
 	return err
@@ -335,7 +381,7 @@ func (s *Server) getAccessToken() (string, error) {
 
 	response, err := s.checkPlatformDetails(baseURL)
 	if err != nil {
-		log.Print("Error while checking server details:", err)
+		s.log().Print("Error while checking server details:", err)
 		return "", err
 	} else if err == nil && response == "" {
 
@@ -358,7 +404,7 @@ func (s *Server) getAccessToken() (string, error) {
 		data, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
 
 		if err != nil {
-			log.Print("[ERROR] grant response error:", err)
+			s.log().Print("[ERROR] grant response error:", err)
 			return "", err
 		}
 
@@ -370,11 +416,11 @@ func (s *Server) getAccessToken() (string, error) {
 		}{}
 
 		if err = json.Unmarshal(data, &grant); err != nil {
-			log.Print("[ERROR] parsing grant response:", err)
+			s.log().Print("[ERROR] parsing grant response:", err)
 			return "", err
 		}
 		if err = s.setCacheAccessToken(grant.AccessToken, grant.ExpiresIn, baseURL); err != nil {
-			log.Print("[ERROR] caching access token:", err)
+			s.log().Print("[ERROR] caching access token:", err)
 			return "", err
 		}
 		return grant.AccessToken, nil
@@ -387,11 +433,11 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 	platformHelthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "health")
 	ssHealthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "api/v1/healthcheck")
 
-	isHealthy := checkJSONResponse(ssHealthCheckUrl)
+	isHealthy := checkJSONResponse(ssHealthCheckUrl, s.log())
 	if isHealthy {
 		return "", nil
 	} else {
-		isHealthy := checkJSONResponse(platformHelthCheckUrl)
+		isHealthy := checkJSONResponse(platformHelthCheckUrl, s.log())
 		if isHealthy {
 
 			accessToken, found := s.getCacheAccessToken(baseURL)
@@ -404,7 +450,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 
 				req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
 				if err != nil {
-					log.Print("Error creating HTTP request:", err)
+					s.log().Print("Error creating HTTP request:", err)
 					return "", err
 				}
 
@@ -412,39 +458,39 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 
 				data, _, err := handleResponse((&http.Client{}).Do(req))
 				if err != nil {
-					log.Print("[ERROR] get token response error:", err)
+					s.log().Print("[ERROR] get token response error:", err)
 					return "", err
 				}
 
 				var tokenjsonResponse OAuthTokens
 				if err = json.Unmarshal(data, &tokenjsonResponse); err != nil {
-					log.Print("[ERROR] parsing get token response:", err)
+					s.log().Print("[ERROR] parsing get token response:", err)
 					return "", err
 				}
 				accessToken = tokenjsonResponse.AccessToken
 
 				if err = s.setCacheAccessToken(tokenjsonResponse.AccessToken, tokenjsonResponse.ExpiresIn, baseURL); err != nil {
-					log.Print("[ERROR] caching access token:", err)
+					s.log().Print("[ERROR] caching access token:", err)
 					return "", err
 				}
 			}
 
 			req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
 			if err != nil {
-				log.Print("Error creating HTTP request:", err)
+				s.log().Print("Error creating HTTP request:", err)
 				return "", err
 			}
 			req.Header.Add("Authorization", "Bearer "+accessToken)
 
 			data, _, err := handleResponse((&http.Client{}).Do(req))
 			if err != nil {
-				log.Print("[ERROR] get vaults response error:", err)
+				s.log().Print("[ERROR] get vaults response error:", err)
 				return "", err
 			}
 
 			var vaultJsonResponse VaultsResponseModel
 			if err = json.Unmarshal(data, &vaultJsonResponse); err != nil {
-				log.Print("[ERROR] parsing vaults response:", err)
+				s.log().Print("[ERROR] parsing vaults response:", err)
 				return "", err
 			}
 
@@ -467,17 +513,17 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 	return "", fmt.Errorf("invalid URL")
 }
 
-func checkJSONResponse(url string) bool {
+func checkJSONResponse(url string, logger Logger) bool {
 	response, err := http.Get(url)
 	if err != nil {
-		log.Println("Error making GET request:", err)
+		logger.Println("Error making GET request:", err)
 		return false
 	}
 	defer response.Body.Close()
 
 	body, err := ioutil.ReadAll(response.Body)
 	if err != nil {
-		log.Println("Error reading response body:", err)
+		logger.Println("Error reading response body:", err)
 		return false
 	}
 
