@@ -37,9 +37,17 @@ type Logger interface {
 // Use this to completely disable logging from the SDK.
 type DiscardLogger struct{}
 
-func (d *DiscardLogger) Printf(format string, v ...interface{}) {}
-func (d *DiscardLogger) Print(v ...interface{})                 {}
-func (d *DiscardLogger) Println(v ...interface{})               {}
+func (d *DiscardLogger) Printf(format string, v ...interface{}) {
+	// Intentionally empty - DiscardLogger is a no-op implementation
+}
+
+func (d *DiscardLogger) Print(v ...interface{}) {
+	// Intentionally empty - DiscardLogger is a no-op implementation
+}
+
+func (d *DiscardLogger) Println(v ...interface{}) {
+	// Intentionally empty - DiscardLogger is a no-op implementation
+}
 
 // stdLogger wraps the standard log package and implements the Logger interface
 type stdLogger struct{}
@@ -383,8 +391,9 @@ func (s *Server) getAccessToken() (string, error) {
 	if err != nil {
 		s.log().Print("Error while checking server details:", err)
 		return "", err
-	} else if err == nil && response == "" {
+	}
 
+	if response == "" {
 		accessToken, found := s.getCacheAccessToken(baseURL)
 		if found {
 			return accessToken, nil
@@ -424,9 +433,9 @@ func (s *Server) getAccessToken() (string, error) {
 			return "", err
 		}
 		return grant.AccessToken, nil
-	} else {
-		return response, nil
 	}
+
+	return response, nil
 }
 
 func (s *Server) checkPlatformDetails(baseURL string) (string, error) {

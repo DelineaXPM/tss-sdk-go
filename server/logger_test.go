@@ -6,6 +6,16 @@ import (
 	"testing"
 )
 
+const (
+	testMessage           = "test %s"
+	testExpectedNonNil    = "Expected non-nil logger"
+	testExpectedDefault   = "Expected defaultLoggerInstance"
+	testExpectedDiscard   = "Expected default logger to be DiscardLogger (silent by default)"
+	testExpectedCustom    = "Expected customLogger"
+	expectedDiscardLogger = "Expected discardLogger"
+	exampleURL            = "https://example.com"
+)
+
 // mockLogger is a test logger that captures log output
 type mockLogger struct {
 	buf bytes.Buffer
@@ -30,7 +40,7 @@ func TestLoggerInterface(t *testing.T) {
 	t.Run("DiscardLogger", func(t *testing.T) {
 		var logger Logger = &DiscardLogger{}
 		// Should not panic
-		logger.Printf("test %s", "message")
+		logger.Printf(testMessage, "message")
 		logger.Print("test")
 		logger.Println("test")
 	})
@@ -38,7 +48,7 @@ func TestLoggerInterface(t *testing.T) {
 	t.Run("stdLogger", func(t *testing.T) {
 		var logger Logger = &stdLogger{}
 		// Should not panic
-		logger.Printf("test %s", "message")
+		logger.Printf(testMessage, "message")
 		logger.Print("test")
 		logger.Println("test")
 	})
@@ -47,7 +57,7 @@ func TestLoggerInterface(t *testing.T) {
 		mock := &mockLogger{}
 		var logger Logger = mock
 
-		logger.Printf("test %s", "message")
+		logger.Printf(testMessage, "message")
 		logger.Print("test")
 		logger.Println("test")
 
@@ -72,17 +82,17 @@ func TestServerLogger(t *testing.T) {
 		logger := s.log()
 
 		if logger == nil {
-			t.Error("Expected non-nil logger")
+			t.Error(testExpectedNonNil)
 		}
 
 		// Should return the default logger instance
 		if logger != defaultLoggerInstance {
-			t.Error("Expected defaultLoggerInstance")
+			t.Error(testExpectedDefault)
 		}
 
 		// Default should be silent (DiscardLogger) per Go library conventions
 		if _, ok := logger.(*DiscardLogger); !ok {
-			t.Error("Expected default logger to be DiscardLogger (silent by default)")
+			t.Error(testExpectedDiscard)
 		}
 	})
 
@@ -98,12 +108,12 @@ func TestServerLogger(t *testing.T) {
 		logger := s.log()
 
 		if logger == nil {
-			t.Error("Expected non-nil logger")
+			t.Error(testExpectedNonNil)
 		}
 
 		// Should return the custom logger
 		if logger != customLogger {
-			t.Error("Expected customLogger")
+			t.Error(testExpectedCustom)
 		}
 	})
 
@@ -119,16 +129,16 @@ func TestServerLogger(t *testing.T) {
 		logger := s.log()
 
 		if logger == nil {
-			t.Error("Expected non-nil logger")
+			t.Error(testExpectedNonNil)
 		}
 
 		// Should return the discard logger
 		if logger != discardLogger {
-			t.Error("Expected discardLogger")
+			t.Error(expectedDiscardLogger)
 		}
 
 		// Should not panic when called
-		logger.Printf("test %s", "message")
+		logger.Printf(testMessage, "message")
 		logger.Print("test")
 		logger.Println("test")
 	})
@@ -138,8 +148,7 @@ func TestServerLogger(t *testing.T) {
 func TestConfigurationWithLogger(t *testing.T) {
 	t.Run("NilLogger", func(t *testing.T) {
 		config := Configuration{
-			ServerURL: "https://example.com",
-			Logger:    nil,
+			Logger: nil,
 		}
 
 		if config.Logger != nil {
@@ -150,32 +159,30 @@ func TestConfigurationWithLogger(t *testing.T) {
 	t.Run("DiscardLogger", func(t *testing.T) {
 		discardLogger := &DiscardLogger{}
 		config := Configuration{
-			ServerURL: "https://example.com",
-			Logger:    discardLogger,
+			Logger: discardLogger,
 		}
 
 		if config.Logger == nil {
-			t.Error("Expected non-nil logger")
+			t.Error(testExpectedNonNil)
 		}
 
 		if config.Logger != discardLogger {
-			t.Error("Expected discardLogger")
+			t.Error(expectedDiscardLogger)
 		}
 	})
 
 	t.Run("CustomLogger", func(t *testing.T) {
 		customLogger := &mockLogger{}
 		config := Configuration{
-			ServerURL: "https://example.com",
-			Logger:    customLogger,
+			Logger: customLogger,
 		}
 
 		if config.Logger == nil {
-			t.Error("Expected non-nil logger")
+			t.Error(testExpectedNonNil)
 		}
 
 		if config.Logger != customLogger {
-			t.Error("Expected customLogger")
+			t.Error(testExpectedCustom)
 		}
 	})
 }
