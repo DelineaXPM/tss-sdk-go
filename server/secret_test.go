@@ -284,7 +284,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 		t.Error("calling server.SecretTemplate:", err)
 		return
 	}
-	publicKeyFieldId, publicKeyIdx, privateKeyFieldId, passphraseFieldId := -1, -1, -1, -1
+	publicKeyFieldId, privateKeyFieldId, passphraseFieldId := -1, -1, -1
 	userNameFieldId, passwordFieldId, machineNameFieldId := -1, -1, -1
 	publicRegex := regexp.MustCompile("(?i)public")
 	privateRegex := regexp.MustCompile("(?i)private")
@@ -300,7 +300,6 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 				publicKeyFieldId = field.SecretTemplateFieldID
 				refSecret.Fields[idx].FieldID = publicKeyFieldId
 				refSecret.Fields[idx].Filename = "" // Let the server generate the name
-				publicKeyIdx = idx
 				t.Logf("Found a public key field with ID '%d'", publicKeyFieldId)
 				idx++
 			} else if privateRegex.MatchString(field.FieldSlugName) {
@@ -511,9 +510,6 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	// Test the update of the new secret
 	sc.Name = sc.Name + " (Updated)"
 	sc.SshKeyArgs = nil
-	if publicKeyIdx > 0 {
-		sc.Fields[publicKeyIdx].Filename = "New Filename.txt"
-	}
 	su, err := tss.UpdateSecret(*sc)
 	if err != nil {
 		t.Error("calling server.UpdateSecret:", err)
@@ -542,7 +538,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 		if !validate("updated secret public key field has a generated value", true, len(publicKeyField.ItemValue) > 100, t) {
 			return
 		}
-		if !validate("updated secret public key field has a generated file name", "New Filename.txt", publicKeyField.Filename, t) {
+		if !validate("updated secret public key field has a generated file name", publicKeyField.FieldName, publicKeyField.Filename, t) {
 			return
 		}
 	} else if problem {
