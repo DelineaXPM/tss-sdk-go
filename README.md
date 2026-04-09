@@ -18,6 +18,8 @@ type UserCredential struct {
 type Configuration struct {
     Credentials UserCredential
     ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
+    TLSClientConfig *tls.Config // Optional: custom TLS configuration
+    Logger          Logger      // Optional: custom logger (silent by default)
 }
 ```
 
@@ -93,7 +95,7 @@ secretModel.Fields[0].ItemValue = somePassword
 newSecret, err := tss.CreateSecret(*secretModel)
 ```
 
-Update the Secret: 
+Update the Secret:
 
 ```golang
 secretModel.ID = newSecret.ID
@@ -106,6 +108,70 @@ Delete the Secret:
 
 ```golang
 err := tss.DeleteSecret(newSecret.ID)
+```
+
+## Logging
+
+Following Go library conventions, **logging is disabled by default**. The SDK will not produce any log output unless you explicitly configure a logger.
+
+### Enabling Logging
+
+To enable logging using Go's standard logger:
+
+```golang
+tss, err := server.New(server.Configuration{
+    Credentials: server.UserCredential{
+        Username: os.Getenv("TSS_USERNAME"),
+        Password: os.Getenv("TSS_PASSWORD"),
+    },
+    ServerURL: os.Getenv("TSS_SERVER_URL"),
+    Logger:    log.Default(), // Enable standard log output
+})
+```
+
+### Custom Logger
+
+You can provide your own logger by implementing the `Logger` interface:
+
+```golang
+type Logger interface {
+    Printf(format string, v ...interface{})
+    Print(v ...interface{})
+    Println(v ...interface{})
+}
+```
+
+Example with a custom logger implementation:
+
+```golang
+type MyCustomLogger struct{}
+
+func (l *MyCustomLogger) Printf(format string, v ...interface{}) {
+    // Custom implementation - e.g., write to file, send to logging service, etc.
+    fmt.Fprintf(os.Stderr, "[CUSTOM] "+format+"\n", v...)
+}
+
+func (l *MyCustomLogger) Print(v ...interface{}) {
+    // Custom implementation
+    fmt.Fprint(os.Stderr, "[CUSTOM] ")
+    fmt.Fprintln(os.Stderr, v...)
+}
+
+func (l *MyCustomLogger) Println(v ...interface{}) {
+    // Custom implementation
+    fmt.Fprint(os.Stderr, "[CUSTOM] ")
+    fmt.Fprintln(os.Stderr, v...)
+}
+
+// Use the custom logger
+tss, err := server.New(server.Configuration{
+    Credentials: server.UserCredential{
+        Username: os.Getenv("TSS_USERNAME"),
+        Password: os.Getenv("TSS_PASSWORD"),
+    },
+    ServerURL: os.Getenv("TSS_SERVER_URL"),
+    Logger:    &MyCustomLogger{},
+})
 ```
 
 ## Test
@@ -134,7 +200,7 @@ tss := New(*config)
 }
 ```
 
-The necessary configuration may also be configured from environment variables: 
+The necessary configuration may also be configured from environment variables:
 
 | Env Var Name   | Description                                                                                                                              |
 |----------------|------------------------------------------------------------------------------------------------------------------------------------------|
@@ -147,12 +213,12 @@ The necessary configuration may also be configured from environment variables:
 | TSS_PLATFORM_URL | URL for Platform, eg: https://delinea.secureplatform.com/                                            |
 
 ### Test #1 - Read Secret Password
-Reads the secret with ID `1` or the ID passed in the `TSS_SECRET_ID` environment variable 
+Reads the secret with ID `1` or the ID passed in the `TSS_SECRET_ID` environment variable
 and extracts the `password` field from it.
 
 ### Test #2 - Perform Secret CRUD
-Creates a secret with a fixed password using the values passed in the environment variables 
-below. It then reads the secret from the server, validates its values, updates it, and deletes 
+Creates a secret with a fixed password using the values passed in the environment variables
+below. It then reads the secret from the server, validates its values, updates it, and deletes
 it.
 
 | Env Var Name      | Description                                                                   |
@@ -163,7 +229,7 @@ it.
 | TSS_TEST_PASSWORD | The password to set for testing                                               |
 
 ### Test #3 - Perform CRUD for an SSH Key Secret
-Creates a secret with generated SSH keys using the values passed in the environment variables 
+Creates a secret with generated SSH keys using the values passed in the environment variables
 below. It then reads the secret from the server, validates its values, updates it, and deletes it.
 
 | Env Var Name                | Description                                                                                                                       |
@@ -189,7 +255,7 @@ Searches for secrets containing text using the values passed in the environment 
 | TSS_SEARCH_TEXT             | The text to search                                                                                                                |
 
 ### Test #6 - Password Generation
-Retrieves the template indicated in the environment variable below, iterates its fields, and 
+Retrieves the template indicated in the environment variable below, iterates its fields, and
 validates that we can generate a password value for every field that is a password field.
 
 | Env Var Name    | Description                                                                   |
@@ -197,5 +263,5 @@ validates that we can generate a password value for every field that is a passwo
 | TSS_TEMPLATE_ID | The numeric ID of the template that defines the secret's fields               |
 
 ### Test #7 - Read Secret By Secret-Path
-Reads the secret with Secret-Path passed in the `TSS_SECRET_PATH` environment variable 
+Reads the secret with Secret-Path passed in the `TSS_SECRET_PATH` environment variable
 and extracts the Secret fields from it.
