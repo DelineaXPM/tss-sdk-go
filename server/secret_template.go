@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -23,11 +24,18 @@ type SecretTemplateField struct {
 	IsFile, IsList, IsNotes, IsPassword, IsRequired, IsUrl  bool
 }
 
-// SecretTemplate gets the secret template with id from the Secret Server of the given tenant
+// SecretTemplate gets the secret template with id from the Secret Server of the given tenant.
+// It uses context.Background() internally; use SecretTemplateWithContext to supply a context.
 func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
+	return s.SecretTemplateWithContext(context.Background(), id)
+}
+
+// SecretTemplateWithContext gets the secret template with id from the Secret Server of the given tenant.
+// The provided context controls cancellation and deadlines for all HTTP requests made.
+func (s Server) SecretTemplateWithContext(ctx context.Context, id int) (*SecretTemplate, error) {
 	secretTemplate := new(SecretTemplate)
 
-	if data, err := s.accessResource("GET", templateResource, strconv.Itoa(id), nil); err == nil {
+	if data, err := s.accessResource(ctx, "GET", templateResource, strconv.Itoa(id), nil); err == nil {
 		if err = json.Unmarshal(data, secretTemplate); err != nil {
 			s.log().Printf("[ERROR] error parsing response from /%s/%d: %q", templateResource, id, data)
 			return nil, err
@@ -42,8 +50,16 @@ func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
 // GeneratePassword generates and returns a password for the secret field identified by the given slug on the given
 // template. The password adheres to the password requirements associated with the field. NOTE: this should only be
 // used with fields whose IsPassword property is true.
+// It uses context.Background() internally; use GeneratePasswordWithContext to supply a context.
 func (s Server) GeneratePassword(slug string, template *SecretTemplate) (string, error) {
+	return s.GeneratePasswordWithContext(context.Background(), slug, template)
+}
 
+// GeneratePasswordWithContext generates and returns a password for the secret field identified by the given slug on
+// the given template. The password adheres to the password requirements associated with the field. NOTE: this should
+// only be used with fields whose IsPassword property is true.
+// The provided context controls cancellation and deadlines for all HTTP requests made.
+func (s Server) GeneratePasswordWithContext(ctx context.Context, slug string, template *SecretTemplate) (string, error) {
 	fieldId, found := template.FieldSlugToId(slug)
 
 	if !found {
@@ -51,7 +67,7 @@ func (s Server) GeneratePassword(slug string, template *SecretTemplate) (string,
 	}
 	path := fmt.Sprintf("generate-password/%d", fieldId)
 
-	if data, err := s.accessResource("POST", templateResource, path, nil); err == nil {
+	if data, err := s.accessResource(ctx, "POST", templateResource, path, nil); err == nil {
 		passwordWithQuotes := string(data)
 		return passwordWithQuotes[1 : len(passwordWithQuotes)-1], nil
 	} else {
