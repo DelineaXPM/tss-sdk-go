@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -46,11 +47,18 @@ type SshKeyArgs struct {
 	GeneratePassphrase, GenerateSshKeys bool
 }
 
-// Secret gets the secret with id from the Secret Server of the given tenant
+// Secret gets the secret with id from the Secret Server of the given tenant.
+// It uses context.Background() internally; use SecretWithContext to supply a context.
 func (s Server) Secret(id int) (*Secret, error) {
+	return s.SecretWithContext(context.Background(), id)
+}
+
+// SecretWithContext gets the secret with id from the Secret Server of the given tenant.
+// The provided context controls cancellation and deadlines for all HTTP requests made.
+func (s Server) SecretWithContext(ctx context.Context, id int) (*Secret, error) {
 	secret := new(Secret)
 
-	if data, err := s.accessResource("GET", resource, strconv.Itoa(id), nil); err == nil {
+	if data, err := s.accessResource(ctx, "GET", resource, strconv.Itoa(id), nil); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
 			s.log().Printf("[ERROR] error parsing response from /%s/%d: %q", resource, id, data)
 			return nil, err
@@ -65,7 +73,7 @@ func (s Server) Secret(id int) (*Secret, error) {
 		if element.IsFile && element.FileAttachmentID != 0 && element.Filename != "" {
 			path := fmt.Sprintf("%d/fields/%s", id, element.Slug)
 
-			if data, err := s.accessResource("GET", resource, path, nil); err == nil {
+			if data, err := s.accessResource(ctx, "GET", resource, path, nil); err == nil {
 				secret.Fields[index].ItemValue = string(data)
 			} else {
 				return nil, err
@@ -76,10 +84,17 @@ func (s Server) Secret(id int) (*Secret, error) {
 	return secret, nil
 }
 
-// Secret gets the secret with id from the Secret Server of the given tenant
+// Secrets searches for secrets matching searchText and returns them fully populated.
+// It uses context.Background() internally; use SecretsWithContext to supply a context.
 func (s Server) Secrets(searchText, field string) ([]Secret, error) {
+	return s.SecretsWithContext(context.Background(), searchText, field)
+}
+
+// SecretsWithContext searches for secrets matching searchText and returns them fully populated.
+// The provided context controls cancellation and deadlines for all HTTP requests made.
+func (s Server) SecretsWithContext(ctx context.Context, searchText, field string) ([]Secret, error) {
 	searchResult := new(SearchResult)
-	if data, err := s.searchResources(resource, searchText, field); err == nil {
+	if data, err := s.searchResources(ctx, resource, searchText, field); err == nil {
 		if err = json.Unmarshal(data, searchResult); err != nil {
 			s.log().Printf("[ERROR] error parsing response from /%s/%s: %q", resource, searchText, data)
 			return nil, err
@@ -92,7 +107,7 @@ func (s Server) Secrets(searchText, field string) ([]Secret, error) {
 	secrets := make([]Secret, len(searchRecords))
 	for i, record := range searchRecords {
 		//secrets returned in search results are not fully populated
-		secret, err := s.Secret(record.ID)
+		secret, err := s.SecretWithContext(ctx, record.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -102,14 +117,22 @@ func (s Server) Secrets(searchText, field string) ([]Secret, error) {
 	return secrets, nil
 }
 
+// SecretByPath gets the secret at the given path from the Secret Server of the given tenant.
+// It uses context.Background() internally; use SecretByPathWithContext to supply a context.
 func (s Server) SecretByPath(secretPath string) (*Secret, error) {
+	return s.SecretByPathWithContext(context.Background(), secretPath)
+}
+
+// SecretByPathWithContext gets the secret at the given path from the Secret Server of the given tenant.
+// The provided context controls cancellation and deadlines for all HTTP requests made.
+func (s Server) SecretByPathWithContext(ctx context.Context, secretPath string) (*Secret, error) {
 	secret := new(Secret)
 	// Encode the secret path to be safe for URLs
 	encodedPath := url.QueryEscape(secretPath)
 	queryPath := fmt.Sprintf("0?secretPath=%s", encodedPath)
 
 	// Perform the GET request to the 'secrets' resource with the specified path
-	if data, err := s.accessResource("GET", resource, queryPath, nil); err == nil {
+	if data, err := s.accessResource(ctx, "GET", resource, queryPath, nil); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
 			s.log().Printf("[ERROR] error parsing response from /%s/%s: %q", resource, secretPath, data)
 			return nil, err
@@ -124,7 +147,7 @@ func (s Server) SecretByPath(secretPath string) (*Secret, error) {
 		if element.IsFile && element.FileAttachmentID != 0 && element.Filename != "" {
 			path := fmt.Sprintf("%d/fields/%s", secret.ID, element.Slug)
 
-			if data, err := s.accessResource("GET", resource, path, nil); err == nil {
+			if data, err := s.accessResource(ctx, "GET", resource, path, nil); err == nil {
 				secret.Fields[index].ItemValue = string(data)
 			} else {
 				return nil, err
@@ -135,24 +158,40 @@ func (s Server) SecretByPath(secretPath string) (*Secret, error) {
 	return secret, nil
 }
 
+// CreateSecret creates a new secret and returns it.
+// It uses context.Background() internally; use CreateSecretWithContext to supply a context.
 func (s Server) CreateSecret(secret Secret) (*Secret, error) {
-	return s.writeSecret(secret, "POST", "/")
+	return s.CreateSecretWithContext(context.Background(), secret)
 }
 
+// CreateSecretWithContext creates a new secret and returns it.
+// The provided context controls cancellation and deadlines for all HTTP requests made.
+func (s Server) CreateSecretWithContext(ctx context.Context, secret Secret) (*Secret, error) {
+	return s.writeSecret(ctx, secret, "POST", "/")
+}
+
+// UpdateSecret updates an existing secret and returns it.
+// It uses context.Background() internally; use UpdateSecretWithContext to supply a context.
 func (s Server) UpdateSecret(secret Secret) (*Secret, error) {
+	return s.UpdateSecretWithContext(context.Background(), secret)
+}
+
+// UpdateSecretWithContext updates an existing secret and returns it.
+// The provided context controls cancellation and deadlines for all HTTP requests made.
+func (s Server) UpdateSecretWithContext(ctx context.Context, secret Secret) (*Secret, error) {
 	if secret.SshKeyArgs != nil && (secret.SshKeyArgs.GenerateSshKeys || secret.SshKeyArgs.GeneratePassphrase) {
 		err := fmt.Errorf("[ERROR] SSH key and passphrase generation is only supported during secret creation. "+
 			"Could not update the secret named '%s'", secret.Name)
 		return nil, err
 	}
 	secret.SshKeyArgs = nil
-	return s.writeSecret(secret, "PUT", strconv.Itoa(secret.ID))
+	return s.writeSecret(ctx, secret, "PUT", strconv.Itoa(secret.ID))
 }
 
-func (s Server) writeSecret(secret Secret, method string, path string) (*Secret, error) {
+func (s Server) writeSecret(ctx context.Context, secret Secret, method string, path string) (*Secret, error) {
 	writtenSecret := new(Secret)
 
-	template, err := s.SecretTemplate(secret.SecretTemplateID)
+	template, err := s.SecretTemplateWithContext(ctx, secret.SecretTemplateID)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +234,7 @@ func (s Server) writeSecret(secret Secret, method string, path string) (*Secret,
 		secret.Fields = make([]SecretField, 0)
 	}
 
-	if data, err := s.accessResource(method, resource, path, secret); err == nil {
+	if data, err := s.accessResource(ctx, method, resource, path, secret); err == nil {
 		if err = json.Unmarshal(data, writtenSecret); err != nil {
 			s.log().Printf("[ERROR] error parsing response from /%s: %q", resource, data)
 			return nil, err
@@ -204,15 +243,23 @@ func (s Server) writeSecret(secret Secret, method string, path string) (*Secret,
 		return nil, err
 	}
 
-	if err := s.updateFiles(writtenSecret.ID, fileFields); err != nil {
+	if err := s.updateFiles(ctx, writtenSecret.ID, fileFields); err != nil {
 		return nil, err
 	}
 
-	return s.Secret(writtenSecret.ID)
+	return s.SecretWithContext(ctx, writtenSecret.ID)
 }
 
+// DeleteSecret deletes the secret with id from the Secret Server of the given tenant.
+// It uses context.Background() internally; use DeleteSecretWithContext to supply a context.
 func (s Server) DeleteSecret(id int) error {
-	_, err := s.accessResource("DELETE", resource, strconv.Itoa(id), nil)
+	return s.DeleteSecretWithContext(context.Background(), id)
+}
+
+// DeleteSecretWithContext deletes the secret with id from the Secret Server of the given tenant.
+// The provided context controls cancellation and deadlines for all HTTP requests made.
+func (s Server) DeleteSecretWithContext(ctx context.Context, id int) error {
+	_, err := s.accessResource(ctx, "DELETE", resource, strconv.Itoa(id), nil)
 	return err
 }
 
@@ -239,7 +286,8 @@ func (s Secret) FieldById(fieldId int) (string, bool) {
 // updateFiles iterates the list of file fields and if the field's item value is empty,
 // deletes the file, otherwise, uploads the contents of the item value as the new/updated
 // file attachment.
-func (s Server) updateFiles(secretId int, fileFields []SecretField) error {
+// ctx controls cancellation and deadlines for all HTTP requests made within this call.
+func (s Server) updateFiles(ctx context.Context, secretId int, fileFields []SecretField) error {
 	type fieldMod struct {
 		Slug  string
 		Dirty bool
@@ -260,11 +308,11 @@ func (s Server) updateFiles(secretId int, fileFields []SecretField) error {
 		if element.ItemValue == "" {
 			path = fmt.Sprintf("%d/general", secretId)
 			input = secretPatch{Data: fieldMods{SecretFields: []fieldMod{{Slug: element.Slug, Dirty: true, Value: nil}}}}
-			if _, err := s.accessResource("PATCH", resource, path, input); err != nil {
+			if _, err := s.accessResource(ctx, "PATCH", resource, path, input); err != nil {
 				return err
 			}
 		} else {
-			if err := s.uploadFile(secretId, element); err != nil {
+			if err := s.uploadFile(ctx, secretId, element); err != nil {
 				return err
 			}
 		}

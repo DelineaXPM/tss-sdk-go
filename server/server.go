@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -175,7 +176,8 @@ func (s Server) urlForSearch(resource, searchText, fieldName string) string {
 
 // accessResource uses the accessToken to access the API resource.
 // It assumes an appropriate combination of method, resource, path and input.
-func (s Server) accessResource(method, resource, path string, input interface{}) ([]byte, error) {
+// ctx controls cancellation and deadlines for all HTTP requests made within this call.
+func (s Server) accessResource(ctx context.Context, method, resource, path string, input interface{}) ([]byte, error) {
 	switch resource {
 	case "secrets":
 	case "secret-templates":
@@ -197,14 +199,14 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		}
 	}
 
-	accessToken, err := s.getAccessToken()
+	accessToken, err := s.getAccessToken(ctx)
 
 	if err != nil {
 		s.log().Print("[ERROR] error getting accessToken:", err)
 		return nil, err
 	}
 
-	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
+	req, err := http.NewRequestWithContext(ctx, method, s.urlFor(resource, path), body)
 
 	if err != nil {
 		s.log().Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
@@ -233,8 +235,9 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 
 // searchResources uses the accessToken to search for API resources.
 // It assumes an appropriate combination of resource, search text.
-// field is optional
-func (s Server) searchResources(resource, searchText, field string) ([]byte, error) {
+// field is optional.
+// ctx controls cancellation and deadlines for all HTTP requests made within this call.
+func (s Server) searchResources(ctx context.Context, resource, searchText, field string) ([]byte, error) {
 	switch resource {
 	case "secrets":
 	default:
@@ -247,14 +250,14 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 	method := "GET"
 	body := bytes.NewBuffer([]byte{})
 
-	accessToken, err := s.getAccessToken()
+	accessToken, err := s.getAccessToken(ctx)
 
 	if err != nil {
 		s.log().Print("[ERROR] error getting accessToken:", err)
 		return nil, err
 	}
 
-	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
+	req, err := http.NewRequestWithContext(ctx, method, s.urlForSearch(resource, searchText, field), body)
 
 	if err != nil {
 		s.log().Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
@@ -272,13 +275,14 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 
 // uploadFile uploads the file described in the given fileField to the
 // secret at the given secretId as a multipart/form-data request.
-func (s Server) uploadFile(secretId int, fileField SecretField) error {
+// ctx controls cancellation and deadlines for all HTTP requests made within this call.
+func (s Server) uploadFile(ctx context.Context, secretId int, fileField SecretField) error {
 	s.log().Printf("[DEBUG] uploading a file to the '%s' field with filename '%s'", fileField.Slug, fileField.Filename)
 	body := bytes.NewBuffer([]byte{})
 	path := fmt.Sprintf("%d/fields/%s", secretId, fileField.Slug)
 
 	// Fetch the access token
-	accessToken, err := s.getAccessToken()
+	accessToken, err := s.getAccessToken(ctx)
 	if err != nil {
 		s.log().Print("[ERROR] error getting accessToken:", err)
 		return err
@@ -308,7 +312,7 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	}
 
 	// Make the request
-	req, err := http.NewRequest("PUT", s.urlFor(resource, path), body)
+	req, err := http.NewRequestWithContext(ctx, "PUT", s.urlFor(resource, path), body)
 	if err != nil {
 		return err
 	}
@@ -375,7 +379,8 @@ func (s *Server) cacheKey(baseURL string) string {
 
 // getAccessToken gets an OAuth2 Access Grant and returns the token
 // endpoint and get an accessGrant.
-func (s *Server) getAccessToken() (string, error) {
+// ctx controls cancellation and deadlines for all HTTP requests made within this call.
+func (s *Server) getAccessToken(ctx context.Context) (string, error) {
 	if s.Credentials.Token != "" {
 		return s.Credentials.Token, nil
 	}
@@ -387,7 +392,7 @@ func (s *Server) getAccessToken() (string, error) {
 		baseURL = s.ServerURL
 	}
 
-	response, err := s.checkPlatformDetails(baseURL)
+	response, err := s.checkPlatformDetails(ctx, baseURL)
 	if err != nil {
 		s.log().Print("Error while checking server details:", err)
 		return "", err
@@ -408,9 +413,17 @@ func (s *Server) getAccessToken() (string, error) {
 			values["domain"] = []string{s.Credentials.Domain}
 		}
 
-		body := strings.NewReader(values.Encode())
 		requestUrl := s.urlFor("token", "")
-		data, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
+
+		// Use NewRequestWithContext so the caller's context (deadlines, cancellation) is honoured.
+		req, err := http.NewRequestWithContext(ctx, "POST", requestUrl, strings.NewReader(values.Encode()))
+		if err != nil {
+			s.log().Print("[ERROR] creating request for token endpoint:", err)
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		data, _, err := handleResponse((&http.Client{}).Do(req))
 
 		if err != nil {
 			s.log().Print("[ERROR] grant response error:", err)
@@ -438,92 +451,110 @@ func (s *Server) getAccessToken() (string, error) {
 	return response, nil
 }
 
-func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
+func (s *Server) checkPlatformDetails(ctx context.Context, baseURL string) (string, error) {
 	platformHelthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "health")
 	ssHealthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "api/v1/healthcheck")
 
-	isHealthy := checkJSONResponse(ssHealthCheckUrl, s.log())
+	isHealthy := checkJSONResponse(ctx, ssHealthCheckUrl, s.log())
 	if isHealthy {
 		return "", nil
-	} else {
-		isHealthy := checkJSONResponse(platformHelthCheckUrl, s.log())
-		if isHealthy {
+	}
+	// If the context was cancelled or timed out while probing the health endpoint,
+	// propagate that error instead of falling through to "invalid URL".
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
+	}
 
-			accessToken, found := s.getCacheAccessToken(baseURL)
-			if !found {
-				requestData := url.Values{}
-				requestData.Set("grant_type", "client_credentials")
-				requestData.Set("client_id", s.Credentials.Username)
-				requestData.Set("client_secret", s.Credentials.Password)
-				requestData.Set("scope", "xpmheadless")
+	isHealthy = checkJSONResponse(ctx, platformHelthCheckUrl, s.log())
+	if isHealthy {
 
-				req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
-				if err != nil {
-					s.log().Print("Error creating HTTP request:", err)
-					return "", err
-				}
+		accessToken, found := s.getCacheAccessToken(baseURL)
+		if !found {
+			requestData := url.Values{}
+			requestData.Set("grant_type", "client_credentials")
+			requestData.Set("client_id", s.Credentials.Username)
+			requestData.Set("client_secret", s.Credentials.Password)
+			requestData.Set("scope", "xpmheadless")
 
-				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-				data, _, err := handleResponse((&http.Client{}).Do(req))
-				if err != nil {
-					s.log().Print("[ERROR] get token response error:", err)
-					return "", err
-				}
-
-				var tokenjsonResponse OAuthTokens
-				if err = json.Unmarshal(data, &tokenjsonResponse); err != nil {
-					s.log().Print("[ERROR] parsing get token response:", err)
-					return "", err
-				}
-				accessToken = tokenjsonResponse.AccessToken
-
-				if err = s.setCacheAccessToken(tokenjsonResponse.AccessToken, tokenjsonResponse.ExpiresIn, baseURL); err != nil {
-					s.log().Print("[ERROR] caching access token:", err)
-					return "", err
-				}
-			}
-
-			req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
+			req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
 			if err != nil {
 				s.log().Print("Error creating HTTP request:", err)
 				return "", err
 			}
-			req.Header.Add("Authorization", "Bearer "+accessToken)
+
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 			data, _, err := handleResponse((&http.Client{}).Do(req))
 			if err != nil {
-				s.log().Print("[ERROR] get vaults response error:", err)
+				s.log().Print("[ERROR] get token response error:", err)
 				return "", err
 			}
 
-			var vaultJsonResponse VaultsResponseModel
-			if err = json.Unmarshal(data, &vaultJsonResponse); err != nil {
-				s.log().Print("[ERROR] parsing vaults response:", err)
+			var tokenjsonResponse OAuthTokens
+			if err = json.Unmarshal(data, &tokenjsonResponse); err != nil {
+				s.log().Print("[ERROR] parsing get token response:", err)
 				return "", err
 			}
+			accessToken = tokenjsonResponse.AccessToken
 
-			var vaultURL string
-			for _, vault := range vaultJsonResponse.Vaults {
-				if vault.IsDefault && vault.IsActive {
-					vaultURL = vault.Connection.Url
-					break
-				}
+			if err = s.setCacheAccessToken(tokenjsonResponse.AccessToken, tokenjsonResponse.ExpiresIn, baseURL); err != nil {
+				s.log().Print("[ERROR] caching access token:", err)
+				return "", err
 			}
-			if vaultURL != "" {
-				s.ServerURL = vaultURL
-			} else {
-				return "", fmt.Errorf("no configured vault found")
-			}
-
-			return accessToken, nil
 		}
+
+		req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
+		if err != nil {
+			s.log().Print("Error creating HTTP request:", err)
+			return "", err
+		}
+		req.Header.Add("Authorization", "Bearer "+accessToken)
+
+		data, _, err := handleResponse((&http.Client{}).Do(req))
+		if err != nil {
+			s.log().Print("[ERROR] get vaults response error:", err)
+			return "", err
+		}
+
+		var vaultJsonResponse VaultsResponseModel
+		if err = json.Unmarshal(data, &vaultJsonResponse); err != nil {
+			s.log().Print("[ERROR] parsing vaults response:", err)
+			return "", err
+		}
+
+		var vaultURL string
+		for _, vault := range vaultJsonResponse.Vaults {
+			if vault.IsDefault && vault.IsActive {
+				vaultURL = vault.Connection.Url
+				break
+			}
+		}
+		if vaultURL != "" {
+			s.ServerURL = vaultURL
+		} else {
+			return "", fmt.Errorf("no configured vault found")
+		}
+
+		return accessToken, nil
+	}
+	// Propagate context errors rather than masking them as "invalid URL".
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
 	}
 	return "", fmt.Errorf("invalid URL")
 }
 
-func checkJSONResponse(url string, logger Logger) bool {
-	response, err := http.Get(url)
+// checkJSONResponse makes a GET request to url and returns true when the
+// response body indicates a healthy JSON service.
+// ctx controls cancellation and deadlines for the underlying HTTP request.
+func checkJSONResponse(ctx context.Context, url string, logger Logger) bool {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		logger.Println("Error creating GET request:", err)
+		return false
+	}
+
+	response, err := (&http.Client{}).Do(req)
 	if err != nil {
 		logger.Println("Error making GET request:", err)
 		return false
