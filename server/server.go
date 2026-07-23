@@ -12,9 +12,9 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -81,17 +81,31 @@ type Configuration struct {
 	ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
 	TLSClientConfig                                  *tls.Config
 	Logger                                           Logger
+	// Timeout, when non-zero, bounds each HTTP request made by the Server.
+	// A zero value keeps the previous behavior of no client-imposed timeout.
+	Timeout time.Duration
 }
 
 // Server provides access to secrets stored in Delinea Secret Server
 type Server struct {
 	Configuration
+	httpClient *http.Client
 }
 
 type TokenCache struct {
 	AccessToken string `json:"access_token"`
 	ExpiresIn   int    `json:"expires_in"`
 }
+
+// tokenCache holds cached access tokens in process memory, keyed by cacheKey.
+// It replaces the previous os.Setenv-based cache: storing a bearer token in the
+// process environment exposed it to child processes and any reader of the
+// process environment (CWE-526). An in-memory store keeps the intra-process
+// reuse and the per-URL/per-username collision keying without that exposure.
+var (
+	tokenCacheMu sync.Mutex
+	tokenCache   = map[string]TokenCache{}
+)
 
 // New returns an initialized Secrets object
 func New(config Configuration) (*Server, error) {
@@ -101,9 +115,6 @@ func New(config Configuration) (*Server, error) {
 	if config.TLD == "" {
 		config.TLD = defaultTLD
 	}
-	if config.TLSClientConfig != nil {
-		http.DefaultTransport.(*http.Transport).TLSClientConfig = config.TLSClientConfig
-	}
 	if config.apiPathURI == "" {
 		config.apiPathURI = defaultAPIPathURI
 	}
@@ -112,7 +123,47 @@ func New(config Configuration) (*Server, error) {
 		config.tokenPathURI = defaultTokenPathURI
 	}
 	config.tokenPathURI = strings.Trim(config.tokenPathURI, "/")
-	return &Server{config}, nil
+	return &Server{Configuration: config, httpClient: newHTTPClient(config)}, nil
+}
+
+// newHTTPClient builds an *http.Client scoped to a single Server. A caller-supplied
+// TLSClientConfig is applied to a fresh transport that copies http.DefaultTransport's
+// tuning, so the process-global transport is never mutated. Mutating it would change TLS
+// verification for all other HTTPS traffic in the process (CWE-295), race with concurrent
+// use, and panic if the default transport had been replaced with a non-*http.Transport.
+// (We copy the default's fields rather than calling Clone(), because Clone() forces the
+// default transport's one-time HTTP/2 initialization, which itself writes to the global.)
+// It returns nil when no per-Server client is needed, in which case the Server falls back
+// to http.DefaultClient.
+func newHTTPClient(config Configuration) *http.Client {
+	if config.TLSClientConfig == nil && config.Timeout == 0 {
+		return nil
+	}
+	client := &http.Client{Timeout: config.Timeout}
+	if config.TLSClientConfig != nil {
+		transport := &http.Transport{}
+		if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport.Proxy = defaultTransport.Proxy
+			transport.DialContext = defaultTransport.DialContext
+			transport.ForceAttemptHTTP2 = defaultTransport.ForceAttemptHTTP2
+			transport.MaxIdleConns = defaultTransport.MaxIdleConns
+			transport.IdleConnTimeout = defaultTransport.IdleConnTimeout
+			transport.TLSHandshakeTimeout = defaultTransport.TLSHandshakeTimeout
+			transport.ExpectContinueTimeout = defaultTransport.ExpectContinueTimeout
+		}
+		transport.TLSClientConfig = config.TLSClientConfig
+		client.Transport = transport
+	}
+	return client
+}
+
+// client returns the per-Server HTTP client, or http.DefaultClient when the Server
+// was configured with neither a TLSClientConfig nor a Timeout.
+func (s Server) client() *http.Client {
+	if s.httpClient != nil {
+		return s.httpClient
+	}
+	return http.DefaultClient
 }
 
 // log returns the logger to use for this Server. If no Logger is configured,
@@ -124,15 +175,19 @@ func (s *Server) log() Logger {
 	return defaultLoggerInstance
 }
 
+// baseURL is the root URL of the Secret Server this Server talks to: the configured
+// ServerURL, or the URL derived from the Secret Server Cloud tenant when no ServerURL
+// is set. New guarantees exactly one of the two is configured.
+func (s Server) baseURL() string {
+	if s.ServerURL == "" {
+		return fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
+	}
+	return s.ServerURL
+}
+
 // urlFor is the URL for the given resource and path
 func (s Server) urlFor(resource, path string) string {
-	var baseURL string
-
-	if s.ServerURL == "" {
-		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
-	} else {
-		baseURL = s.ServerURL
-	}
+	baseURL := s.baseURL()
 
 	switch {
 	case resource == "token":
@@ -149,25 +204,30 @@ func (s Server) urlFor(resource, path string) string {
 }
 
 func (s Server) urlForSearch(resource, searchText, fieldName string) string {
-	var baseURL string
-
-	if s.ServerURL == "" {
-		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
-	} else {
-		baseURL = s.ServerURL
-	}
+	baseURL := s.baseURL()
 	switch {
 	case resource == "secrets":
-		url := fmt.Sprintf("%s/%s/%s?paging.filter.searchText=%s&paging.filter.searchField=%s&paging.filter.doNotCalculateTotal=true&paging.take=30&&paging.skip=0",
+		// Build the query with url.Values so searchText/fieldName are encoded and
+		// cannot inject or override query parameters (e.g. a searchText of
+		// "foo&paging.take=100000").
+		query := url.Values{}
+		query.Set("paging.filter.searchText", searchText)
+		query.Set("paging.filter.searchField", fieldName)
+		query.Set("paging.filter.doNotCalculateTotal", "true")
+		query.Set("paging.take", "30")
+		query.Set("paging.skip", "0")
+		if fieldName == "" {
+			query.Add("paging.filter.extendedFields", "Machine")
+			query.Add("paging.filter.extendedFields", "Notes")
+			query.Add("paging.filter.extendedFields", "Username")
+		} else {
+			query.Set("paging.filter.isExactMatch", "true")
+		}
+		return fmt.Sprintf("%s/%s/%s?%s",
 			strings.Trim(baseURL, "/"),
 			strings.Trim(s.apiPathURI, "/"),
 			strings.Trim(resource, "/"),
-			searchText,
-			fieldName)
-		if fieldName == "" {
-			return fmt.Sprintf("%s%s", url, "&paging.filter.extendedFields=Machine&paging.filter.extendedFields=Notes&paging.filter.extendedFields=Username")
-		}
-		return fmt.Sprintf("%s%s", url, "&paging.filter.isExactMatch=true")
+			query.Encode())
 	default:
 		return ""
 	}
@@ -183,7 +243,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		message := "unknown resource"
 
 		s.log().Printf("[ERROR] %s: %s", message, resource)
-		return nil, fmt.Errorf(message)
+		return nil, fmt.Errorf("%s", message)
 	}
 
 	body := bytes.NewBuffer([]byte{})
@@ -220,10 +280,11 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 
 	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
-	data, statusCode, err := handleResponse((&http.Client{}).Do(req))
+	data, statusCode, err := handleResponse(s.client().Do(req))
 
-	// Check for unauthorized or access denied
-	if statusCode.StatusCode == http.StatusUnauthorized || statusCode.StatusCode == http.StatusForbidden {
+	// Check for unauthorized or access denied. statusCode is nil on a transport
+	// error (e.g. a Timeout-induced context deadline), so guard before dereferencing.
+	if statusCode != nil && (statusCode.StatusCode == http.StatusUnauthorized || statusCode.StatusCode == http.StatusForbidden) {
 		s.clearTokenCache()
 		s.log().Printf("[ERROR] Token cache cleared due to unauthorized or access denied response.")
 	}
@@ -241,7 +302,7 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 		message := "unknown resource"
 
 		s.log().Printf("[ERROR] %s: %s", message, resource)
-		return nil, fmt.Errorf(message)
+		return nil, fmt.Errorf("%s", message)
 	}
 
 	method := "GET"
@@ -265,7 +326,7 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 
 	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
-	data, _, err := handleResponse((&http.Client{}).Do(req))
+	data, _, err := handleResponse(s.client().Do(req))
 
 	return data, err
 }
@@ -275,7 +336,7 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	s.log().Printf("[DEBUG] uploading a file to the '%s' field with filename '%s'", fileField.Slug, fileField.Filename)
 	body := bytes.NewBuffer([]byte{})
-	path := fmt.Sprintf("%d/fields/%s", secretId, fileField.Slug)
+	path := fmt.Sprintf("%d/fields/%s", secretId, url.PathEscape(fileField.Slug))
 
 	// Fetch the access token
 	accessToken, err := s.getAccessToken()
@@ -315,7 +376,7 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	s.log().Printf("[DEBUG] uploading file with PUT %s", req.URL.String())
-	_, _, err = handleResponse((&http.Client{}).Do(req))
+	_, _, err = handleResponse(s.client().Do(req))
 
 	return err
 }
@@ -325,44 +386,30 @@ func (s *Server) setCacheAccessToken(value string, expiresIn int, baseURL string
 	cache.AccessToken = value
 	cache.ExpiresIn = (int(time.Now().Unix()) + expiresIn) - int(math.Floor(float64(expiresIn)*0.9))
 
-	data, _ := json.Marshal(cache)
-	os.Setenv(s.cacheKey(baseURL), string(data))
+	tokenCacheMu.Lock()
+	tokenCache[s.cacheKey(baseURL)] = cache
+	tokenCacheMu.Unlock()
 	return nil
 }
 
 func (s *Server) getCacheAccessToken(baseURL string) (string, bool) {
-	// Try the new per-username key first
-	data, ok := os.LookupEnv(s.cacheKey(baseURL))
-	if ok && data != "" {
-		cache := TokenCache{}
-		if err := json.Unmarshal([]byte(data), &cache); err == nil {
-			if time.Now().Unix() < int64(cache.ExpiresIn) {
-				return cache.AccessToken, true
-			}
-		}
+	tokenCacheMu.Lock()
+	cache, ok := tokenCache[s.cacheKey(baseURL)]
+	tokenCacheMu.Unlock()
+	if ok && time.Now().Unix() < int64(cache.ExpiresIn) {
+		return cache.AccessToken, true
 	}
 	s.clearTokenCache()
 	return "", false
 }
 
 func (s *Server) clearTokenCache() {
-	var baseURL string
-
-	if s.ServerURL == "" {
-		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
-	} else {
-		baseURL = s.ServerURL
-	}
-
-	// Clear the new per-username cache key
-	os.Setenv(s.cacheKey(baseURL), "")
-
-	// Also clear the legacy cache key to avoid leftover stale tokens
-	legacyKey := "SS_AT_" + url.QueryEscape(baseURL)
-	os.Setenv(legacyKey, "")
+	tokenCacheMu.Lock()
+	delete(tokenCache, s.cacheKey(s.baseURL()))
+	tokenCacheMu.Unlock()
 }
 
-// cacheKey returns an environment variable key unique to the base URL and
+// cacheKey returns an in-memory cache key unique to the base URL and
 // credentials (username). This prevents token collisions when multiple Server
 // instances use the same ServerURL but different credentials.
 func (s *Server) cacheKey(baseURL string) string {
@@ -379,13 +426,7 @@ func (s *Server) getAccessToken() (string, error) {
 	if s.Credentials.Token != "" {
 		return s.Credentials.Token, nil
 	}
-	var baseURL string
-
-	if s.ServerURL == "" {
-		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
-	} else {
-		baseURL = s.ServerURL
-	}
+	baseURL := s.baseURL()
 
 	response, err := s.checkPlatformDetails(baseURL)
 	if err != nil {
@@ -410,7 +451,7 @@ func (s *Server) getAccessToken() (string, error) {
 
 		body := strings.NewReader(values.Encode())
 		requestUrl := s.urlFor("token", "")
-		data, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
+		data, _, err := handleResponse(s.client().Post(requestUrl, "application/x-www-form-urlencoded", body))
 
 		if err != nil {
 			s.log().Print("[ERROR] grant response error:", err)
@@ -442,107 +483,127 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 	platformHelthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "health")
 	ssHealthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "api/v1/healthcheck")
 
-	isHealthy := checkJSONResponse(ssHealthCheckUrl, s.log())
+	isHealthy, ssErr := s.checkJSONResponse(ssHealthCheckUrl)
 	if isHealthy {
 		return "", nil
-	} else {
-		isHealthy := checkJSONResponse(platformHelthCheckUrl, s.log())
-		if isHealthy {
+	}
+	if ssErr != nil {
+		s.log().Println("[ERROR] Secret Server health check:", ssErr)
+	}
 
-			accessToken, found := s.getCacheAccessToken(baseURL)
-			if !found {
-				requestData := url.Values{}
-				requestData.Set("grant_type", "client_credentials")
-				requestData.Set("client_id", s.Credentials.Username)
-				requestData.Set("client_secret", s.Credentials.Password)
-				requestData.Set("scope", "xpmheadless")
+	isHealthy, platformErr := s.checkJSONResponse(platformHelthCheckUrl)
+	if !isHealthy {
+		if platformErr != nil {
+			s.log().Println("[ERROR] Platform health check:", platformErr)
+		}
+		return "", healthCheckError(ssHealthCheckUrl, ssErr, platformHelthCheckUrl, platformErr)
+	}
 
-				req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
-				if err != nil {
-					s.log().Print("Error creating HTTP request:", err)
-					return "", err
-				}
+	accessToken, found := s.getCacheAccessToken(baseURL)
+	if !found {
+		requestData := url.Values{}
+		requestData.Set("grant_type", "client_credentials")
+		requestData.Set("client_id", s.Credentials.Username)
+		requestData.Set("client_secret", s.Credentials.Password)
+		requestData.Set("scope", "xpmheadless")
 
-				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
+		if err != nil {
+			s.log().Print("Error creating HTTP request:", err)
+			return "", err
+		}
 
-				data, _, err := handleResponse((&http.Client{}).Do(req))
-				if err != nil {
-					s.log().Print("[ERROR] get token response error:", err)
-					return "", err
-				}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-				var tokenjsonResponse OAuthTokens
-				if err = json.Unmarshal(data, &tokenjsonResponse); err != nil {
-					s.log().Print("[ERROR] parsing get token response:", err)
-					return "", err
-				}
-				accessToken = tokenjsonResponse.AccessToken
+		data, _, err := handleResponse(s.client().Do(req))
+		if err != nil {
+			s.log().Print("[ERROR] get token response error:", err)
+			return "", err
+		}
 
-				if err = s.setCacheAccessToken(tokenjsonResponse.AccessToken, tokenjsonResponse.ExpiresIn, baseURL); err != nil {
-					s.log().Print("[ERROR] caching access token:", err)
-					return "", err
-				}
-			}
+		var tokenjsonResponse OAuthTokens
+		if err = json.Unmarshal(data, &tokenjsonResponse); err != nil {
+			s.log().Print("[ERROR] parsing get token response:", err)
+			return "", err
+		}
+		accessToken = tokenjsonResponse.AccessToken
 
-			req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
-			if err != nil {
-				s.log().Print("Error creating HTTP request:", err)
-				return "", err
-			}
-			req.Header.Add("Authorization", "Bearer "+accessToken)
-
-			data, _, err := handleResponse((&http.Client{}).Do(req))
-			if err != nil {
-				s.log().Print("[ERROR] get vaults response error:", err)
-				return "", err
-			}
-
-			var vaultJsonResponse VaultsResponseModel
-			if err = json.Unmarshal(data, &vaultJsonResponse); err != nil {
-				s.log().Print("[ERROR] parsing vaults response:", err)
-				return "", err
-			}
-
-			var vaultURL string
-			for _, vault := range vaultJsonResponse.Vaults {
-				if vault.IsDefault && vault.IsActive {
-					vaultURL = vault.Connection.Url
-					break
-				}
-			}
-			if vaultURL != "" {
-				s.ServerURL = vaultURL
-			} else {
-				return "", fmt.Errorf("no configured vault found")
-			}
-
-			return accessToken, nil
+		if err = s.setCacheAccessToken(tokenjsonResponse.AccessToken, tokenjsonResponse.ExpiresIn, baseURL); err != nil {
+			s.log().Print("[ERROR] caching access token:", err)
+			return "", err
 		}
 	}
-	return "", fmt.Errorf("invalid URL")
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
+	if err != nil {
+		s.log().Print("Error creating HTTP request:", err)
+		return "", err
+	}
+	req.Header.Add("Authorization", "Bearer "+accessToken)
+
+	data, _, err := handleResponse(s.client().Do(req))
+	if err != nil {
+		s.log().Print("[ERROR] get vaults response error:", err)
+		return "", err
+	}
+
+	var vaultJsonResponse VaultsResponseModel
+	if err = json.Unmarshal(data, &vaultJsonResponse); err != nil {
+		s.log().Print("[ERROR] parsing vaults response:", err)
+		return "", err
+	}
+
+	var vaultURL string
+	for _, vault := range vaultJsonResponse.Vaults {
+		if vault.IsDefault && vault.IsActive {
+			vaultURL = vault.Connection.Url
+			break
+		}
+	}
+	if vaultURL == "" {
+		return "", fmt.Errorf("no configured vault found")
+	}
+	s.ServerURL = vaultURL
+
+	return accessToken, nil
 }
 
-func checkJSONResponse(url string, logger Logger) bool {
-	response, err := http.Get(url)
+// healthCheckError reports why neither health check identified a Secret Server or a
+// Platform at the configured URL. Both probes previously collapsed into a bare
+// "invalid URL", with the transport error reaching only the logger: an untrusted CA,
+// blocked egress, a DNS failure, an unhealthy or proxied endpoint, and a genuinely
+// wrong URL were indistinguishable to the caller and to anything reporting on its
+// behalf. The underlying error is wrapped so callers can still match it with errors.As.
+func healthCheckError(ssURL string, ssErr error, platformURL string, platformErr error) error {
+	switch {
+	case ssErr != nil && platformErr != nil:
+		return fmt.Errorf("could not reach Secret Server at %s (%v) or Platform at %s: %w", ssURL, ssErr, platformURL, platformErr)
+	case ssErr != nil:
+		return fmt.Errorf("could not reach Secret Server at %s: %w (Platform at %s responded but did not report healthy)", ssURL, ssErr, platformURL)
+	case platformErr != nil:
+		return fmt.Errorf("could not reach Platform at %s: %w (Secret Server at %s responded but did not report healthy)", platformURL, platformErr, ssURL)
+	default:
+		return fmt.Errorf("%s and %s responded but neither reported a healthy Secret Server or Platform", ssURL, platformURL)
+	}
+}
+
+func (s *Server) checkJSONResponse(url string) (bool, error) {
+	response, err := s.client().Get(url)
 	if err != nil {
-		logger.Println("Error making GET request:", err)
-		return false
+		return false, fmt.Errorf("probing %s: %w", url, err)
 	}
 	defer response.Body.Close()
 
 	body, err := ioutil.ReadAll(response.Body)
 	if err != nil {
-		logger.Println("Error reading response body:", err)
-		return false
+		return false, fmt.Errorf("reading response from %s: %w", url, err)
 	}
 
 	var jsonResponse Response
-	err = json.Unmarshal(body, &jsonResponse)
-	if err == nil {
-		return jsonResponse.Healthy
-	} else {
-		return strings.Contains(string(body), "Healthy")
+	if err := json.Unmarshal(body, &jsonResponse); err != nil {
+		return strings.Contains(string(body), "Healthy"), nil
 	}
+	return jsonResponse.Healthy, nil
 }
 
 type Response struct {

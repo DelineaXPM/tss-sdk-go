@@ -63,7 +63,7 @@ func (s Server) Secret(id int) (*Secret, error) {
 	// (dummy) ItemValue, so as to make the process transparent to the caller
 	for index, element := range secret.Fields {
 		if element.IsFile && element.FileAttachmentID != 0 && element.Filename != "" {
-			path := fmt.Sprintf("%d/fields/%s", id, element.Slug)
+			path := fmt.Sprintf("%d/fields/%s", id, url.PathEscape(element.Slug))
 
 			if data, err := s.accessResource("GET", resource, path, nil); err == nil {
 				secret.Fields[index].ItemValue = string(data)
@@ -122,7 +122,7 @@ func (s Server) SecretByPath(secretPath string) (*Secret, error) {
 	// (dummy) ItemValue, to make the process transparent to the caller
 	for index, element := range secret.Fields {
 		if element.IsFile && element.FileAttachmentID != 0 && element.Filename != "" {
-			path := fmt.Sprintf("%d/fields/%s", secret.ID, element.Slug)
+			path := fmt.Sprintf("%d/fields/%s", secret.ID, url.PathEscape(element.Slug))
 
 			if data, err := s.accessResource("GET", resource, path, nil); err == nil {
 				secret.Fields[index].ItemValue = string(data)
