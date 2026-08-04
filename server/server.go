@@ -86,6 +86,12 @@ type Configuration struct {
 	// Timeout, when non-zero, bounds each HTTP request made by the Server.
 	// A zero value keeps the previous behavior of no client-imposed timeout.
 	Timeout time.Duration
+	// MaxResponseBytes, when positive, overrides the default cap
+	// (defaultMaxResponseBytes) on the size of an API response body the SDK
+	// will read into memory. Raise it only for an on-premises Secret Server
+	// whose file-attachment size limit has been configured above the default
+	// cap.
+	MaxResponseBytes int64
 }
 
 // Server provides access to secrets stored in Delinea Secret Server
@@ -286,7 +292,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 
 	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
-	data, statusCode, err := handleResponse(s.client().Do(req))
+	data, statusCode, err := s.handleResponse(s.client().Do(req))
 
 	s.evictOnAuthFailure(statusCode, tokenBaseURL)
 
@@ -342,7 +348,7 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 
 	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
-	data, statusCode, err := handleResponse(s.client().Do(req))
+	data, statusCode, err := s.handleResponse(s.client().Do(req))
 
 	s.evictOnAuthFailure(statusCode, tokenBaseURL)
 
@@ -396,7 +402,7 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	s.log().Printf("[DEBUG] uploading file with PUT %s", req.URL.String())
-	_, statusCode, err := handleResponse(s.client().Do(req))
+	_, statusCode, err := s.handleResponse(s.client().Do(req))
 
 	s.evictOnAuthFailure(statusCode, tokenBaseURL)
 
@@ -521,7 +527,7 @@ func (s *Server) getAccessToken() (string, error) {
 
 		body := strings.NewReader(values.Encode())
 		requestUrl := s.urlFor("token", "")
-		data, _, err := handleResponse(s.client().Post(requestUrl, "application/x-www-form-urlencoded", body))
+		data, _, err := s.handleResponse(s.client().Post(requestUrl, "application/x-www-form-urlencoded", body))
 
 		if err != nil {
 			s.log().Print("[ERROR] grant response error:", err)
@@ -585,7 +591,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-		data, _, err := handleResponse(s.client().Do(req))
+		data, _, err := s.handleResponse(s.client().Do(req))
 		if err != nil {
 			s.log().Print("[ERROR] get token response error:", err)
 			return "", err
@@ -611,7 +617,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 	}
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 
-	data, vaultsResponse, err := handleResponse(s.client().Do(req))
+	data, vaultsResponse, err := s.handleResponse(s.client().Do(req))
 	if err != nil {
 		// This is the first use of the cached Platform token. If the Platform refuses
 		// it, evict it: otherwise a revoked or rotated token is served from cache for
@@ -666,6 +672,10 @@ func healthCheckError(ssURL string, ssErr error, platformURL string, platformErr
 	}
 }
 
+// maxHealthResponseBytes bounds a health-probe response; genuine health checks are
+// tiny, so anything larger is not a healthy Secret Server or Platform.
+const maxHealthResponseBytes = 1 << 20
+
 func (s *Server) checkJSONResponse(url string) (bool, error) {
 	response, err := s.client().Get(url)
 	if err != nil {
@@ -673,9 +683,12 @@ func (s *Server) checkJSONResponse(url string) (bool, error) {
 	}
 	defer response.Body.Close()
 
-	body, err := ioutil.ReadAll(response.Body)
+	body, err := ioutil.ReadAll(io.LimitReader(response.Body, maxHealthResponseBytes+1))
 	if err != nil {
 		return false, fmt.Errorf("reading response from %s: %w", url, err)
+	}
+	if len(body) > maxHealthResponseBytes {
+		return false, fmt.Errorf("health response from %s exceeded %d bytes", url, maxHealthResponseBytes)
 	}
 
 	var jsonResponse Response

@@ -124,3 +124,35 @@ func TestCheckJSONResponseHealthyBodyWithoutJSON(t *testing.T) {
 		t.Error("checkJSONResponse did not honor the non-JSON healthy body")
 	}
 }
+
+// healthCheckError has one message per combination of probe outcomes. Each must name
+// both probed URLs and keep an underlying error matchable with errors.Is.
+func TestHealthCheckErrorVariants(t *testing.T) {
+	const ssURL, platformURL = "https://ss.example.com/api/v1/healthcheck", "https://platform.example.com/health"
+	ssErr := errors.New("secret server probe failed")
+	platformErr := errors.New("platform probe failed")
+
+	for _, c := range []struct {
+		name        string
+		ssErr       error
+		platformErr error
+		wrapped     error
+	}{
+		{"both failed", ssErr, platformErr, platformErr},
+		{"secret server failed", ssErr, nil, ssErr},
+		{"platform failed", nil, platformErr, platformErr},
+		{"both reachable but unhealthy", nil, nil, nil},
+	} {
+		err := healthCheckError(ssURL, c.ssErr, platformURL, c.platformErr)
+		if err == nil {
+			t.Errorf("%s: healthCheckError returned nil", c.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), ssURL) || !strings.Contains(err.Error(), platformURL) {
+			t.Errorf("%s: error %q does not name both probed URLs", c.name, err)
+		}
+		if c.wrapped != nil && !errors.Is(err, c.wrapped) {
+			t.Errorf("%s: error does not wrap the underlying cause: %v", c.name, err)
+		}
+	}
+}
