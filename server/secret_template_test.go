@@ -15,8 +15,7 @@ func VerifySecretTemplate(t *testing.T, tss *Server) {
 	template, err := tss.SecretTemplate(id)
 
 	if err != nil {
-		t.Error("calling secrets.SecretTemplate:", err)
-		return
+		t.Fatal("calling secrets.SecretTemplate:", err)
 	}
 
 	if template == nil {
