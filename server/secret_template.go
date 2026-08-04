@@ -43,20 +43,33 @@ func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
 // template. The password adheres to the password requirements associated with the field. NOTE: this should only be
 // used with fields whose IsPassword property is true.
 func (s Server) GeneratePassword(slug string, template *SecretTemplate) (string, error) {
-
 	fieldId, found := template.FieldSlugToId(slug)
 
 	if !found {
-		s.log().Printf("[ERROR] the alias '%s' does not identify a field on the template named '%s'", slug, template.Name)
+		err := fmt.Errorf("the alias '%s' does not identify a field on the template named '%s'", slug, template.Name)
+		s.log().Print("[ERROR] ", err)
+		return "", err
 	}
 	path := fmt.Sprintf("generate-password/%d", fieldId)
 
-	if data, err := s.accessResource("POST", templateResource, path, nil); err == nil {
-		passwordWithQuotes := string(data)
-		return passwordWithQuotes[1 : len(passwordWithQuotes)-1], nil
-	} else {
+	data, err := s.accessResource("POST", templateResource, path, nil)
+	if err != nil {
 		return "", err
 	}
+
+	// The endpoint returns a JSON string. Unmarshaling replaces the previous
+	// blind strip of the first and last byte, which mishandled escapes and
+	// panicked on a response shorter than two bytes. Decoding into *string
+	// rejects a JSON null, which unmarshals into a plain string as a no-op and
+	// would otherwise be returned as a valid empty password.
+	var password *string
+	if err := json.Unmarshal(data, &password); err != nil {
+		return "", fmt.Errorf("parsing generate-password response: %w", err)
+	}
+	if password == nil || *password == "" {
+		return "", fmt.Errorf("generate-password response contained no password")
+	}
+	return *password, nil
 }
 
 // FieldIdToSlug returns the shorthand alias (aka: "slug") of the field with the given field ID, and a boolean
