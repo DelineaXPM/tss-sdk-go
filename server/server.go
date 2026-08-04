@@ -77,6 +77,54 @@ type UserCredential struct {
 	Domain, Username, Password, Token string
 }
 
+// String redacts the secret fields of a credential. Server embeds Configuration and
+// Configuration's fields are exported, so printing either with %v or %+v — which is what
+// a consumer reaches for when a call is misbehaving — would otherwise write the password
+// and any supplied token wherever that output goes. fmt consults this method for a
+// UserCredential nested inside another value, so the redaction holds for a Configuration
+// and for a Server.
+//
+// An unset secret prints as empty rather than as the redaction: whether a password is
+// configured at all is the first thing worth knowing from such a dump, and it is not
+// what the redaction is protecting.
+func (c UserCredential) String() string {
+	return fmt.Sprintf("{Domain:%s Username:%s Password:%s Token:%s}",
+		c.Domain, c.Username, redactSecret(c.Password), redactSecret(c.Token))
+}
+
+// GoString covers %#v, which prints a Go-syntax representation and ignores String. The
+// redacted fields stay quoted so the result is still the Go syntax the verb promises.
+func (c UserCredential) GoString() string {
+	return fmt.Sprintf("server.UserCredential{Domain:%q, Username:%q, Password:%q, Token:%q}",
+		c.Domain, c.Username, redactSecret(c.Password), redactSecret(c.Token))
+}
+
+// MarshalJSON prevents a Configuration copied into diagnostics, telemetry, or an API
+// response from serializing a live password or bearer token. UnmarshalJSON is
+// intentionally not implemented: credential configuration files continue to decode
+// normally, but marshaling credentials is a redacted diagnostic representation rather
+// than a round trip suitable for writing a new credential file.
+func (c UserCredential) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Domain   string
+		Username string
+		Password string
+		Token    string
+	}{
+		Domain:   c.Domain,
+		Username: c.Username,
+		Password: redactSecret(c.Password),
+		Token:    redactSecret(c.Token),
+	})
+}
+
+func redactSecret(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	return "<redacted>"
+}
+
 // Configuration settings for the API
 type Configuration struct {
 	Credentials                                      UserCredential

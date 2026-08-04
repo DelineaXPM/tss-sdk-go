@@ -29,7 +29,7 @@ func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
 
 	if data, err := s.accessResource("GET", templateResource, strconv.Itoa(id), nil); err == nil {
 		if err = json.Unmarshal(data, secretTemplate); err != nil {
-			s.log().Printf("[ERROR] error parsing response from /%s/%d: %q", templateResource, id, data)
+			s.log().Printf("[ERROR] parsing response from /%s/%d: %v (%d-byte body not logged)", templateResource, id, err, len(data))
 			return nil, err
 		}
 	} else {

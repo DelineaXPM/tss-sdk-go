@@ -52,7 +52,8 @@ func (s Server) Secret(id int) (*Secret, error) {
 
 	if data, err := s.accessResource("GET", resource, strconv.Itoa(id), nil); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
-			s.log().Printf("[ERROR] error parsing response from /%s/%d: %q", resource, id, data)
+			// The unparsed body may contain secret material, so it is never logged.
+			s.log().Printf("[ERROR] parsing response from /%s/%d: %v (%d-byte body not logged)", resource, id, err, len(data))
 			return nil, err
 		}
 	} else {
@@ -81,7 +82,7 @@ func (s Server) Secrets(searchText, field string) ([]Secret, error) {
 	searchResult := new(SearchResult)
 	if data, err := s.searchResources(resource, searchText, field); err == nil {
 		if err = json.Unmarshal(data, searchResult); err != nil {
-			s.log().Printf("[ERROR] error parsing response from /%s/%s: %q", resource, searchText, data)
+			s.log().Printf("[ERROR] parsing response from /%s/%s: %v (%d-byte body not logged)", resource, searchText, err, len(data))
 			return nil, err
 		}
 	} else {
@@ -111,7 +112,7 @@ func (s Server) SecretByPath(secretPath string) (*Secret, error) {
 	// Perform the GET request to the 'secrets' resource with the specified path
 	if data, err := s.accessResource("GET", resource, queryPath, nil); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
-			s.log().Printf("[ERROR] error parsing response from /%s/%s: %q", resource, secretPath, data)
+			s.log().Printf("[ERROR] parsing response from /%s/%s: %v (%d-byte body not logged)", resource, secretPath, err, len(data))
 			return nil, err
 		}
 	} else {
@@ -197,7 +198,7 @@ func (s Server) writeSecret(secret Secret, method string, path string) (*Secret,
 
 	if data, err := s.accessResource(method, resource, path, secret); err == nil {
 		if err = json.Unmarshal(data, writtenSecret); err != nil {
-			s.log().Printf("[ERROR] error parsing response from /%s: %q", resource, data)
+			s.log().Printf("[ERROR] parsing response from /%s: %v (%d-byte body not logged)", resource, err, len(data))
 			return nil, err
 		}
 	} else {

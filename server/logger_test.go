@@ -13,7 +13,6 @@ const (
 	testExpectedDiscard   = "Expected default logger to be DiscardLogger (silent by default)"
 	testExpectedCustom    = "Expected customLogger"
 	expectedDiscardLogger = "Expected discardLogger"
-	exampleURL            = "https://example.com"
 )
 
 // mockLogger is a test logger that captures log output
