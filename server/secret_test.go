@@ -1,135 +1,90 @@
 package server
 
 import (
-	"encoding/json"
-	"io/ioutil"
-	"os"
 	"regexp"
-	"strconv"
 	"testing"
 )
 
 // TestSecret tests Secret. Referred to as "Test #1" in the README.
 func TestSecret(t *testing.T) {
-	t.Run("SecretServer_TestSecret", func(t *testing.T) {
-		tss, err := initServer()
-		if err != nil {
-			t.Error("configuring the Server:", err)
-			return
-		}
-		GetSecret(t, tss)
-	})
-
-	t.Run("Platform_TestSecret", func(t *testing.T) {
-		tss, err := initPlatformServer()
-		if err != nil {
-			t.Error("configuring the Platform Server:", err)
-			return
-		}
-		GetSecret(t, tss)
-	})
+	runBattery(t, GetSecret)
 }
 
 func GetSecret(t *testing.T, tss *Server) {
-	id := initIntegerFromEnv("TSS_SECRET_ID", t)
-	if id < 0 {
-		return
-	}
-
+	id := requireIntEnv(t, "TSS_SECRET_ID")
 	s, err := tss.Secret(id)
 
 	if err != nil {
-		t.Error("calling server.Secret:", err)
-		return
+		t.Fatal("calling server.Secret:", err)
 	}
 
 	if s == nil {
-		t.Error("secret data is nil")
+		t.Fatal("secret data is nil")
 	}
 
 	if _, ok := s.Field("password"); !ok {
-		t.Error("no password field")
+		t.Fatal("no password field")
 	}
 
 	if _, ok := s.Field("nonexistent"); ok {
-		t.Error("s.Field says nonexistent field exists")
+		t.Fatal("s.Field says nonexistent field exists")
 	}
 }
 
 // TestSecretCRUD tests the creation, read, update, and delete of a Secret.
 // Referred to as "Test #2" in the README.
 func TestSecretCRUD(t *testing.T) {
-	t.Run("SecretServer_TestSecretCRUD", func(t *testing.T) {
-		tss, err := initServer()
-		if err != nil {
-			t.Error("configuring the Server:", err)
-			return
-		}
-		SecretCRUD(t, tss)
-	})
-
-	t.Run("Platform_TestSecretCRUD", func(t *testing.T) {
-		tss, err := initPlatformServer()
-		if err != nil {
-			t.Error("configuring the Platform Server:", err)
-			return
-		}
-		SecretCRUD(t, tss)
-	})
+	runBattery(t, SecretCRUD)
 }
 
 func SecretCRUD(t *testing.T, tss *Server) {
-	siteId := initIntegerFromEnv("TSS_SITE_ID", t)
-	folderId := initIntegerFromEnv("TSS_FOLDER_ID", t)
-	templateId := initIntegerFromEnv("TSS_TEMPLATE_ID", t)
-	testPassword := os.Getenv("TSS_TEST_PASSWORD")
-
-	if testPassword == "" {
-		t.Error("testPassword is blank")
-		return
-	}
-
-	if siteId < 0 || folderId < 0 || templateId < 0 {
-		return
-	}
+	siteId := requireIntEnv(t, "TSS_SITE_ID")
+	folderId := requireIntEnv(t, "TSS_FOLDER_ID")
+	templateId := requireIntEnv(t, "TSS_TEMPLATE_ID")
+	testPassword := requireEnv(t, "TSS_TEST_PASSWORD")
 
 	// Retrieve the template so we know what fields are required
 	refSecretTemplate, err := tss.SecretTemplate(templateId)
 	if err != nil {
-		t.Error("calling server.SecretTemplate:", err)
-		return
+		t.Fatal("calling server.SecretTemplate:", err)
 	}
 
-	// Build the fields based on what the template requires
+	// Build the fields the template calls for. Every required field must be filled:
+	// omitting one earns an "API_RequiredFieldMissing: Secret field is required"
+	// from the server, which does not say which field it wanted. Recognized fields
+	// get realistic values; any other required field gets a placeholder, so the case
+	// works against templates beyond the ones named here.
 	var fields []SecretField
 	for _, field := range refSecretTemplate.Fields {
+		value := ""
 		switch {
 		case field.IsPassword:
-			fields = append(fields, SecretField{
-				FieldID:   field.SecretTemplateFieldID,
-				ItemValue: testPassword,
-			})
+			value = testPassword
 		case regexp.MustCompile(`(?i)username`).MatchString(field.FieldSlugName):
-			fields = append(fields, SecretField{
-				FieldID:   field.SecretTemplateFieldID,
-				ItemValue: "TestUser",
-			})
+			value = "TestUser"
 		case regexp.MustCompile(`(?i)url`).MatchString(field.FieldSlugName):
-			fields = append(fields, SecretField{
-				FieldID:   field.SecretTemplateFieldID,
-				ItemValue: "https://example.com",
-			})
+			value = "https://example.com"
+		case regexp.MustCompile(`(?i)machine|host`).MatchString(field.FieldSlugName):
+			value = "test.example.com"
 		case regexp.MustCompile(`(?i)notes`).MatchString(field.FieldSlugName):
+			value = "delete after use"
+		case field.IsRequired && field.IsFile:
+			t.Fatalf("template %d requires the file field %q, which this case cannot generate; "+
+				"point TSS_TEMPLATE_ID at a template whose required fields are text",
+				templateId, field.FieldSlugName)
+		case field.IsRequired:
+			value = "test-" + field.FieldSlugName
+		}
+		if value != "" {
 			fields = append(fields, SecretField{
 				FieldID:   field.SecretTemplateFieldID,
-				ItemValue: "delete after use",
+				ItemValue: value,
 			})
 		}
 	}
 
 	if len(fields) == 0 {
-		t.Errorf("No usable fields found in template %d", templateId)
-		return
+		t.Fatalf("No usable fields found in template %d", templateId)
 	}
 
 	// Test creation of a new secret
@@ -142,13 +97,12 @@ func SecretCRUD(t *testing.T, tss *Server) {
 
 	sc, err := tss.CreateSecret(*refSecret)
 	if err != nil {
-		t.Error("calling server.CreateSecret:", err)
-		return
+		t.Fatal("calling server.CreateSecret:", err)
 	}
 	if sc == nil {
-		t.Error("created secret data is nil")
-		return
+		t.Fatal("created secret data is nil")
 	}
+	deleteAfterTest(t, tss, sc.ID)
 	if !validate("created secret folder id", folderId, sc.FolderID, t) {
 		return
 	}
@@ -169,8 +123,7 @@ func SecretCRUD(t *testing.T, tss *Server) {
 	}
 	createdPassword, matched := sc.FieldById(passwordFieldID)
 	if !matched {
-		t.Errorf("created secret does not have a password field with the given field id '%d':", passwordFieldID)
-		return
+		t.Fatalf("created secret does not have a password field with the given field id '%d':", passwordFieldID)
 	}
 	if !validate("created secret password value", testPassword, createdPassword, t) {
 		return
@@ -179,12 +132,10 @@ func SecretCRUD(t *testing.T, tss *Server) {
 	// Test the read of the new secret
 	sr, err := tss.Secret(sc.ID)
 	if err != nil {
-		t.Error("calling server.Secret:", err)
-		return
+		t.Fatal("calling server.Secret:", err)
 	}
 	if sr == nil {
-		t.Error("read secret data is nil")
-		return
+		t.Fatal("read secret data is nil")
 	}
 
 	// Update the password field
@@ -198,17 +149,14 @@ func SecretCRUD(t *testing.T, tss *Server) {
 
 	su, err := tss.UpdateSecret(*refSecret)
 	if err != nil {
-		t.Error("calling server.UpdateSecret:", err)
-		return
+		t.Fatal("calling server.UpdateSecret:", err)
 	}
 	if su == nil {
-		t.Error("updated secret data is nil")
-		return
+		t.Fatal("updated secret data is nil")
 	}
 	updatedPassword, matched := su.FieldById(passwordFieldID)
 	if !matched {
-		t.Errorf("updated secret does not have a password field with the given field id '%d':", passwordFieldID)
-		return
+		t.Fatalf("updated secret does not have a password field with the given field id '%d':", passwordFieldID)
 	}
 	if !validate("updated secret password value", newPassword, updatedPassword, t) {
 		return
@@ -217,14 +165,18 @@ func SecretCRUD(t *testing.T, tss *Server) {
 	// Test the deletion of the new secret
 	err = tss.DeleteSecret(sc.ID)
 	if err != nil {
-		t.Error("calling server.DeleteSecret:", err)
-		return
+		t.Fatal("calling server.DeleteSecret:", err)
 	}
 
-	// Test read of the deleted secret fails
+	// A deleted secret must not come back live. Secret Server refuses the read with
+	// API_AccessDenied; a Platform vault keeps the recycled secret readable with Active
+	// false. Both are correct, so requiring an error here would fail against a Platform.
 	s, err := tss.Secret(sc.ID)
+	if err == nil && s == nil {
+		t.Errorf("reading deleted secret %d returned neither a secret nor an error", sc.ID)
+	}
 	if s != nil && s.Active {
-		t.Errorf("deleted secret with id '%d' returned from read", sc.ID)
+		t.Fatalf("deleted secret with id '%d' is still active after deletion", sc.ID)
 	}
 }
 
@@ -232,37 +184,14 @@ func SecretCRUD(t *testing.T, tss *Server) {
 // of a Secret which uses an SSH key template, that is, a template with extended
 // mappings that support SSH keys. Referred to as "Test #3" in the README.
 func TestSecretCRUDForSSHTemplate(t *testing.T) {
-	t.Run("SecretServer_TestSecretCRUDForSSHTemplate", func(t *testing.T) {
-		tss, err := initServer()
-		if err != nil {
-			t.Error("configuring the Server:", err)
-			return
-		}
-		SecretCRUDForSSHTemplate(t, tss)
-	})
-
-	t.Run("Platform_TestSecretCRUDForSSHTemplate", func(t *testing.T) {
-		tss, err := initPlatformServer()
-		if err != nil {
-			t.Error("configuring the Platform Server:", err)
-			return
-		}
-		SecretCRUDForSSHTemplate(t, tss)
-	})
+	runBattery(t, SecretCRUDForSSHTemplate)
 }
 
 func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
-	siteId := initIntegerFromEnv("TSS_SITE_ID", t)
-	folderId := initIntegerFromEnv("TSS_FOLDER_ID", t)
-	templateId := initIntegerFromEnv("TSS_SSH_KEY_TEMPLATE_ID", t)
-	testPassword := os.Getenv("TSS_TEST_PASSWORD")
-	if siteId < 0 || folderId < 0 || templateId < 0 {
-		return
-	}
-	if testPassword == "" {
-		t.Error("testPassword is blank")
-		return
-	}
+	siteId := requireIntEnv(t, "TSS_SITE_ID")
+	folderId := requireIntEnv(t, "TSS_FOLDER_ID")
+	templateId := requireIntEnv(t, "TSS_SSH_KEY_TEMPLATE_ID")
+	testPassword := requireEnv(t, "TSS_TEST_PASSWORD")
 
 	// Initialize a new secret
 	refSecret := new(Secret)
@@ -281,8 +210,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	// Make a best-effort attempt to find the fields related to SSH key generation
 	refSecretTemplate, err := tss.SecretTemplate(templateId)
 	if err != nil {
-		t.Error("calling server.SecretTemplate:", err)
-		return
+		t.Fatal("calling server.SecretTemplate:", err)
 	}
 	publicKeyFieldId, privateKeyFieldId, passphraseFieldId := -1, -1, -1
 	userNameFieldId, passwordFieldId, machineNameFieldId := -1, -1, -1
@@ -344,13 +272,12 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	// Test creation of a new secret
 	sc, err := tss.CreateSecret(*refSecret)
 	if err != nil {
-		t.Error("calling server.CreateSecret:", err)
-		return
+		t.Fatal("calling server.CreateSecret:", err)
 	}
 	if sc == nil {
-		t.Error("created secret data is nil")
-		return
+		t.Fatal("created secret data is nil")
 	}
+	deleteAfterTest(t, tss, sc.ID)
 	if !validate("created secret name", "Test SSH Key Secret", sc.Name, t) {
 		return
 	}
@@ -427,12 +354,10 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	// Test the read of the new secret
 	sr, err := tss.Secret(sc.ID)
 	if err != nil {
-		t.Error("calling server.Secret:", err)
-		return
+		t.Fatal("calling server.Secret:", err)
 	}
 	if sr == nil {
-		t.Error("read secret data is nil")
-		return
+		t.Fatal("read secret data is nil")
 	}
 	if !validate("read secret name", "Test SSH Key Secret", sr.Name, t) {
 		return
@@ -446,7 +371,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	if !validate("read secret site id", siteId, sr.SiteID, t) {
 		return
 	}
-	if publicKeyField, problem := getField(sc, publicKeyFieldId, t); publicKeyField != nil && !problem {
+	if publicKeyField, problem := getField(sr, publicKeyFieldId, t); publicKeyField != nil && !problem {
 		if !validate("read secret public key field is a file field", true, publicKeyField.IsFile, t) {
 			return
 		}
@@ -459,7 +384,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	} else if problem {
 		return
 	}
-	if privateKeyField, problem := getField(sc, privateKeyFieldId, t); privateKeyField != nil && !problem {
+	if privateKeyField, problem := getField(sr, privateKeyFieldId, t); privateKeyField != nil && !problem {
 		if !validate("read secret private key field is a file field", true, privateKeyField.IsFile, t) {
 			return
 		}
@@ -472,7 +397,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	} else if problem {
 		return
 	}
-	if passphraseField, problem := getField(sc, passphraseFieldId, t); passphraseField != nil && !problem {
+	if passphraseField, problem := getField(sr, passphraseFieldId, t); passphraseField != nil && !problem {
 		if !validate("read secret passphrase field is a password field", true, passphraseField.IsPassword, t) {
 			return
 		}
@@ -482,14 +407,14 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	} else if problem {
 		return
 	}
-	if userNameField, problem := getField(sc, userNameFieldId, t); userNameField != nil && !problem {
+	if userNameField, problem := getField(sr, userNameFieldId, t); userNameField != nil && !problem {
 		if !validate("read secret username field has the given value", userName, userNameField.ItemValue, t) {
 			return
 		}
 	} else if problem {
 		return
 	}
-	if passwordField, problem := getField(sc, passwordFieldId, t); passwordField != nil && !problem {
+	if passwordField, problem := getField(sr, passwordFieldId, t); passwordField != nil && !problem {
 		if !validate("read secret password field is a password field", true, passwordField.IsPassword, t) {
 			return
 		}
@@ -499,7 +424,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	} else if problem {
 		return
 	}
-	if machineNameField, problem := getField(sc, machineNameFieldId, t); machineNameField != nil && !problem {
+	if machineNameField, problem := getField(sr, machineNameFieldId, t); machineNameField != nil && !problem {
 		if !validate("read secret machine name field has a value", machine, machineNameField.ItemValue, t) {
 			return
 		}
@@ -512,12 +437,10 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	sc.SshKeyArgs = nil
 	su, err := tss.UpdateSecret(*sc)
 	if err != nil {
-		t.Error("calling server.UpdateSecret:", err)
-		return
+		t.Fatal("calling server.UpdateSecret:", err)
 	}
 	if su == nil {
-		t.Error("updated secret data is nil")
-		return
+		t.Fatal("updated secret data is nil")
 	}
 	if !validate("updated secret name", "Test SSH Key Secret (Updated)", su.Name, t) {
 		return
@@ -531,20 +454,24 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	if !validate("updated secret site id", siteId, su.SiteID, t) {
 		return
 	}
-	if publicKeyField, problem := getField(sc, publicKeyFieldId, t); publicKeyField != nil && !problem {
+	if publicKeyField, problem := getField(su, publicKeyFieldId, t); publicKeyField != nil && !problem {
 		if !validate("updated secret public key field is a file field", true, publicKeyField.IsFile, t) {
 			return
 		}
 		if !validate("updated secret public key field has a generated value", true, len(publicKeyField.ItemValue) > 100, t) {
 			return
 		}
-		if !validate("updated secret public key field has a generated file name", publicKeyField.FieldName, publicKeyField.Filename, t) {
+		// The update re-uploads the generated file, and uploadFile gives an
+		// extensionless name an extension, so the server's "Public Key" comes back as
+		// "Public Key.txt". The private key keeps its name because it already had one.
+		if !validate("updated secret public key field has a generated file name",
+			publicKeyField.FieldName+".txt", publicKeyField.Filename, t) {
 			return
 		}
 	} else if problem {
 		return
 	}
-	if privateKeyField, problem := getField(sc, privateKeyFieldId, t); privateKeyField != nil && !problem {
+	if privateKeyField, problem := getField(su, privateKeyFieldId, t); privateKeyField != nil && !problem {
 		if !validate("updated secret private key field is a file field", true, privateKeyField.IsFile, t) {
 			return
 		}
@@ -557,7 +484,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	} else if problem {
 		return
 	}
-	if passphraseField, problem := getField(sc, passphraseFieldId, t); passphraseField != nil && !problem {
+	if passphraseField, problem := getField(su, passphraseFieldId, t); passphraseField != nil && !problem {
 		if !validate("updated secret passphrase field is a password field", true, passphraseField.IsPassword, t) {
 			return
 		}
@@ -567,14 +494,14 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	} else if problem {
 		return
 	}
-	if userNameField, problem := getField(sc, userNameFieldId, t); userNameField != nil && !problem {
+	if userNameField, problem := getField(su, userNameFieldId, t); userNameField != nil && !problem {
 		if !validate("updated secret username field has the given value", userName, userNameField.ItemValue, t) {
 			return
 		}
 	} else if problem {
 		return
 	}
-	if passwordField, problem := getField(sc, passwordFieldId, t); passwordField != nil && !problem {
+	if passwordField, problem := getField(su, passwordFieldId, t); passwordField != nil && !problem {
 		if !validate("updated secret password field is a password field", true, passwordField.IsPassword, t) {
 			return
 		}
@@ -584,7 +511,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	} else if problem {
 		return
 	}
-	if machineNameField, problem := getField(sc, machineNameFieldId, t); machineNameField != nil && !problem {
+	if machineNameField, problem := getField(su, machineNameFieldId, t); machineNameField != nil && !problem {
 		if !validate("updated secret machine name field has a value", machine, machineNameField.ItemValue, t) {
 			return
 		}
@@ -595,50 +522,39 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	// Test the deletion of the new secret
 	err = tss.DeleteSecret(sc.ID)
 	if err != nil {
-		t.Error("calling server.DeleteSecret:", err)
-		return
+		t.Fatal("calling server.DeleteSecret:", err)
 	}
 
-	// Test read of the deleted secret fails
+	// A deleted secret must not come back live. Secret Server refuses the read with
+	// API_AccessDenied; a Platform vault keeps the recycled secret readable with Active
+	// false. Both are correct, so requiring an error here would fail against a Platform.
 	s, err := tss.Secret(sc.ID)
+	if err == nil && s == nil {
+		t.Errorf("reading deleted secret %d returned neither a secret nor an error", sc.ID)
+	}
 	if s != nil && s.Active {
-		t.Errorf("deleted secret with id '%d' returned from read", sc.ID)
+		t.Fatalf("deleted secret with id '%d' is still active after deletion", sc.ID)
 	}
 }
 
 // TestSearch tests Secret. Referred to as "Test #4" in the README.
 func TestSearch(t *testing.T) {
-	t.Run("SecretServer_TestSearch", func(t *testing.T) {
-		tss, err := initServer()
-		if err != nil {
-			t.Error("configuring the Server:", err)
-			return
-		}
-		Search(t, tss)
-	})
-
-	t.Run("Platform_TestSearch", func(t *testing.T) {
-		tss, err := initPlatformServer()
-		if err != nil {
-			t.Error("configuring the Platform Server:", err)
-			return
-		}
-		Search(t, tss)
-	})
+	runBattery(t, Search)
 }
 
 func Search(t *testing.T, tss *Server) {
 
-	s, err := tss.Secrets(os.Getenv("TSS_SEARCH_TEXT"), os.Getenv("TSS_SEARCH_FIELD"))
+	searchText := requireEnv(t, "TSS_SEARCH_TEXT")
+	searchField := requireEnv(t, "TSS_SEARCH_FIELD")
+
+	s, err := tss.Secrets(searchText, searchField)
 
 	if err != nil {
-		t.Error("calling server.Secret:", err)
-		return
+		t.Fatal("calling server.Secret:", err)
 	}
 
-	if s == nil || len(s) == 0 {
-		t.Error("secret data is nil or empty")
-		return
+	if len(s) == 0 {
+		t.Fatal("secret data is nil or empty")
 	}
 
 	if _, ok := s[0].Field("password"); !ok {
@@ -648,37 +564,20 @@ func Search(t *testing.T, tss *Server) {
 
 // TestSearchWithoutField tests Secret. Referred to as "Test #5" in the README.
 func TestSearchWithoutField(t *testing.T) {
-	t.Run("SecretServer_TestSearchWithoutField", func(t *testing.T) {
-		tss, err := initServer()
-		if err != nil {
-			t.Error("configuring the Server:", err)
-			return
-		}
-		SearchWithoutField(t, tss)
-	})
-
-	t.Run("Platform_TestSearchWithoutField", func(t *testing.T) {
-		tss, err := initPlatformServer()
-		if err != nil {
-			t.Error("configuring the Platform Server:", err)
-			return
-		}
-		SearchWithoutField(t, tss)
-	})
+	runBattery(t, SearchWithoutField)
 }
 
 func SearchWithoutField(t *testing.T, tss *Server) {
 
-	s, err := tss.Secrets(os.Getenv("TSS_SEARCH_TEXT"), "")
+	s, err := tss.Secrets(requireEnv(t, "TSS_SEARCH_TEXT"), "")
 
 	if err != nil {
-		t.Error("calling server.Secret:", err)
-		return
+		t.Fatal("calling server.Secret:", err)
 	}
 
-	if s == nil || len(s) == 0 {
-		t.Error("secret data is nil or empty")
-		return
+	// Fatal, not Error: the next line indexes s[0].
+	if len(s) == 0 {
+		t.Fatal("secret data is nil or empty")
 	}
 
 	if _, ok := s[0].Field("password"); !ok {
@@ -688,40 +587,21 @@ func SearchWithoutField(t *testing.T, tss *Server) {
 
 // TestSecretByPath tests Secret. Referred to as "Test #7" in the README.
 func TestSecretByPath(t *testing.T) {
-	t.Run("SecretServer_TestSecretByPath", func(t *testing.T) {
-		tss, err := initServer()
-		if err != nil {
-			t.Error("configuring the Server:", err)
-			return
-		}
-		GetSecretByPath(t, tss)
-	})
-
-	t.Run("Platform_TestSecretByPath", func(t *testing.T) {
-		tss, err := initPlatformServer()
-		if err != nil {
-			t.Error("configuring the Platform Server:", err)
-			return
-		}
-		GetSecretByPath(t, tss)
-	})
+	runBattery(t, GetSecretByPath)
 }
 
 func GetSecretByPath(t *testing.T, tss *Server) {
-	secretPath := initStringFromEnv("TSS_SECRET_PATH", t)
-	if secretPath == "" {
-		t.Error("TSS_SECRET_PATH is not set or empty")
-		return
-	}
+	// requireEnv skips or fails when the variable is unset, so secretPath is non-empty.
+	secretPath := requireEnv(t, "TSS_SECRET_PATH")
 
 	secret, err := tss.SecretByPath(secretPath)
 	if err != nil {
-		t.Errorf("Error retrieving secret by path: %v", err)
-		return
+		t.Fatalf("Error retrieving secret by path: %v", err)
 	}
 
+	// Fatal, not Error: every assertion below dereferences secret.
 	if secret == nil {
-		t.Error("Expected a secret, got nil")
+		t.Fatal("Expected a secret, got nil")
 	}
 
 	if secret.Name == "" {
@@ -737,83 +617,26 @@ func GetSecretByPath(t *testing.T, tss *Server) {
 	}
 }
 
-func initServer() (*Server, error) {
-	var config *Configuration
-
-	if cj, err := ioutil.ReadFile("../test_config.json"); err == nil {
-		config = new(Configuration)
-
-		json.Unmarshal(cj, &config)
-	} else {
-		config = &Configuration{
-			Credentials: UserCredential{
-				Username: os.Getenv("TSS_USERNAME"),
-				Password: os.Getenv("TSS_PASSWORD"),
-			},
-			// Expecting either the tenant or URL to be set
-			Tenant:    os.Getenv("TSS_TENANT"),
-			ServerURL: os.Getenv("TSS_SERVER_URL"),
-		}
-	}
-	return New(*config)
-}
-
-func initPlatformServer() (*Server, error) {
-	var config *Configuration
-
-	if cj, err := ioutil.ReadFile("../test_config.json"); err == nil {
-		config = new(Configuration)
-
-		json.Unmarshal(cj, &config)
-	} else {
-		config = &Configuration{
-			Credentials: UserCredential{
-				Username: os.Getenv("TSS_PLATFORM_USERNAME"),
-				Password: os.Getenv("TSS_PLATFORM_PASSWORD"),
-			},
-			ServerURL: os.Getenv("TSS_PLATFORM_URL"),
-		}
-	}
-	return New(*config)
-}
-
-// initIntegerFromEnv reads the given environment variable and if it's declared, parses it to an integer. Otherwise,
-// returns a default integer of '1'.
-func initIntegerFromEnv(envVarName string, t *testing.T) int {
-	intValue := 1
-	valueFromEnv := os.Getenv(envVarName)
-	if valueFromEnv != "" {
-		var err error
-		intValue, err = strconv.Atoi(valueFromEnv)
-		if err != nil {
-			t.Errorf("%s must be an integer: %s", envVarName, err)
-			return -1
-		}
-	}
-	return intValue
-}
-
-// initStringFromEnv reads a string value from the given environment variable.
-// Otherwise returns a default string '/Personal/admin/New Secret'.
-func initStringFromEnv(envVarName string, t *testing.T) string {
-	defaultValue := "/Personal/admin/New Secret"
-	value := os.Getenv(envVarName)
-	if value == "" {
-		t.Logf("%s not set, using default: %s", envVarName, defaultValue)
-		return defaultValue
-	}
-	return value
-}
-
+// validate reports whether found equals expected, naming both on failure. It formats
+// with %v rather than %q because most of these values are ints and bools, which %q
+// renders as "%!q(int=3)". t.Helper points the failure at the assertion rather than
+// at this line.
 func validate(label string, expected interface{}, found interface{}, t *testing.T) bool {
+	t.Helper()
 	if expected != found {
-		t.Errorf("expecting '%s' to be '%q', but found '%q' instead.", label, expected, found)
+		t.Errorf("%s: got %v, want %v", label, found, expected)
 		return false
 	}
 	return true
 }
 
+// getField returns the field with the given id, and whether looking it up went wrong.
+// Note the second value is NOT the usual comma-ok "found": it reports a *problem*, so
+// callers read `if field, problem := getField(...); field != nil && !problem`. A
+// fieldId of zero or less means the caller never located that field on the template,
+// which is not an error here — it yields (nil, false) so the block is skipped quietly.
 func getField(secret *Secret, fieldId int, t *testing.T) (*SecretField, bool) {
+	t.Helper()
 	if fieldId > 0 {
 		for _, field := range secret.Fields {
 			if field.FieldID == fieldId {
