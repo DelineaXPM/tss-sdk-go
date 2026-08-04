@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -101,7 +103,7 @@ type TokenCache struct {
 // It replaces the previous os.Setenv-based cache: storing a bearer token in the
 // process environment exposed it to child processes and any reader of the
 // process environment (CWE-526). An in-memory store keeps the intra-process
-// reuse and the per-URL/per-username collision keying without that exposure.
+// reuse and the per-URL/per-credential collision keying without that exposure.
 var (
 	tokenCacheMu sync.Mutex
 	tokenCache   = map[string]TokenCache{}
@@ -384,9 +386,23 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 func (s *Server) setCacheAccessToken(value string, expiresIn int, baseURL string) error {
 	cache := TokenCache{}
 	cache.AccessToken = value
-	cache.ExpiresIn = (int(time.Now().Unix()) + expiresIn) - int(math.Floor(float64(expiresIn)*0.9))
+	// Serve the cached token for 90% of its lifetime, refreshing before it
+	// expires. The previous formula subtracted the 90% instead of the 10%
+	// safety margin, so tokens were re-fetched after a tenth of their
+	// lifetime, forcing ~10x more credential round trips than necessary.
+	cache.ExpiresIn = int(time.Now().Unix()) + int(math.Floor(float64(expiresIn)*0.9))
 
 	tokenCacheMu.Lock()
+	// Sweep expired entries while holding the lock: an entry is otherwise deleted
+	// only when its exact key is queried again, and a key embeds the credential
+	// digest, so entries orphaned by a password rotation would accumulate for the
+	// life of the process.
+	now := time.Now().Unix()
+	for key, entry := range tokenCache {
+		if int64(entry.ExpiresIn) <= now {
+			delete(tokenCache, key)
+		}
+	}
 	tokenCache[s.cacheKey(baseURL)] = cache
 	tokenCacheMu.Unlock()
 	return nil
@@ -409,15 +425,36 @@ func (s *Server) clearTokenCache() {
 	tokenCacheMu.Unlock()
 }
 
-// cacheKey returns an in-memory cache key unique to the base URL and
-// credentials (username). This prevents token collisions when multiple Server
-// instances use the same ServerURL but different credentials.
+// cacheKey returns an in-memory cache key unique to the base URL and the whole
+// credential: domain, username, and a digest of the password. This prevents token
+// collisions when multiple Server instances use the same ServerURL but different
+// credentials, including two accounts that share a username and differ only by Domain
+// (e.g. a local account and a directory account). The first three fields are joined
+// with "&", which url.QueryEscape always escapes, and the digest is hex, so no two
+// distinct credentials can produce the same key.
+//
+// The password belongs in the key because a cache hit returns before the grant is
+// built, so the password of the Server making the call is never presented to the
+// server. Keying without it means a Server whose password is stale, rotated or simply
+// wrong is served a token obtained with a different password, so a bad credential
+// succeeds and a rotated one is not adopted until the entry expires.
 func (s *Server) cacheKey(baseURL string) string {
-	key := "SS_AT_" + url.QueryEscape(baseURL)
-	if s.Credentials.Username != "" {
-		key = key + "_" + url.QueryEscape(s.Credentials.Username)
-	}
-	return key
+	return url.QueryEscape(baseURL) +
+		"&" + url.QueryEscape(s.Credentials.Domain) +
+		"&" + url.QueryEscape(s.Credentials.Username) +
+		"&" + passwordDigest(s.Credentials.Password)
+}
+
+// passwordDigest reduces a password to something that can key a cache entry without
+// being the password: the key lives in a package-level map for the life of the
+// process, which is not somewhere a credential should sit in cleartext (the same
+// reasoning that moved the token itself out of the environment). The digest is
+// unsalted, which is not password storage and is not meant to be: the plaintext is
+// already in this process's memory, in Credentials, so the digest adds no exposure it
+// does not already have. It exists to distinguish credentials, not to protect them.
+func passwordDigest(password string) string {
+	sum := sha256.Sum256([]byte(password))
+	return hex.EncodeToString(sum[:])
 }
 
 // getAccessToken gets an OAuth2 Access Grant and returns the token
