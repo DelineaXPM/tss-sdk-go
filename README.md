@@ -7,36 +7,91 @@ A Golang API and examples for [Delinea](https://delinea.com/)
 
 ## Configure
 
-The API requires a `Configuration` object containing a `Username`, `Password`
-and either a `Tenant` for Secret Server Cloud or a `ServerURL` of Secret Server/Platform:
+The API requires a `server.Configuration` containing credentials and exactly one of
+`Tenant` (Secret Server Cloud) or `ServerURL` (Secret Server or Platform):
 
 ```golang
-type UserCredential struct {
-    Username, Password string
-}
-
-type Configuration struct {
-    Credentials UserCredential
-    ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
-    TLSClientConfig *tls.Config // Optional: custom TLS configuration
-    Logger          Logger      // Optional: custom logger (silent by default)
+tss, err := server.New(server.Configuration{
+    Credentials: server.UserCredential{
+        Username: os.Getenv("TSS_USERNAME"),
+        Password: os.Getenv("TSS_PASSWORD"),
+    },
+    Tenant: os.Getenv("TSS_TENANT"),
+})
+if err != nil {
+    log.Fatal(err)
 }
 ```
+
+### TLS configuration
+
+A `TLSClientConfig` is applied only to the HTTP client used by the `Server` it is
+configured on. It does **not** modify `http.DefaultTransport` or affect any other HTTPS
+traffic in your process, so a custom `RootCAs` pool for Secret Server never changes
+certificate verification elsewhere. The TLS configuration is cloned; changing it after
+`New` returns does not mutate the running client.
+
+`HTTPClient` can supply a proxying, tracing, or policy transport. The SDK preserves that
+client's transport, cookie jar, and redirect policy in a scoped copy. If both
+`HTTPClient` and `TLSClientConfig` are set, the transport must be an `*http.Transport`
+so the TLS policy can be cloned safely; `New` otherwise returns an error instead of
+silently bypassing either policy.
+
+Redirects are restricted to the original origin. Token endpoints do not follow redirects,
+preventing passwords and client secrets from being replayed to a redirect target.
+
+### Request timeout
+
+Every request has a 60-second timeout by default. Set `Timeout` to choose another bound,
+or set `DisableTimeout` only when every call uses a context deadline. Public operations
+have context variants such as `SecretContext`, `SecretsContext`, and
+`CreateSecretContext`.
+
+Safe reads (`GET` and `HEAD`) retry transient network errors, HTTP 429, and HTTP 5xx up
+to two times with exponential jitter. Writes, deletes, generated-password requests, and
+uploads are never retried. `MaxRetries`, `RetryBaseDelay`, and `DisableRetries` customize
+that behavior.
+
+### Platform vault trust
+
+Platform discovery accepts only HTTPS vault URLs. Same-origin vaults and Delinea Secret
+Server Cloud domains are trusted by default. For an on-premises Platform that returns a
+vault on another host, add that exact hostname (or `host:port`) to `AllowedVaultHosts`,
+or provide a `VaultURLValidator`. Plaintext URLs, user information, query strings, and
+fragments are always rejected.
+
+### Response size cap
+
+The SDK reads at most 100 MiB of an API response body, well above Secret Server's default
+10 MB file-attachment limit and Delinea's recommended maximum of 30 MB. If your
+on-premises Secret Server is configured to allow larger attachments, set
+`MaxResponseBytes` to a matching value. An oversized response returns an error.
+
+### Credential redaction
+
+Formatting a `Server`, `Configuration`, or `UserCredential` with the `fmt` verbs (`%v`,
+`%+v`, `%s`, `%#v`) prints `<redacted>` in place of `Password` and `Token`.
+`encoding/json` also emits redaction markers while JSON configuration files still
+decode normally. Other serializers and reflection can still inspect exported fields;
+do not send a live `Configuration` to telemetry or a generic serializer.
 
 ## Use
 
 Define a `Configuration`, use it to create an instance of `Server` for Secret Server:
 
 ```golang
-tss := server.New(server.Configuration{
-    Credentials: UserCredential{
+tss, err := server.New(server.Configuration{
+    Credentials: server.UserCredential{
         Username: os.Getenv("TSS_USERNAME"),
         Password: os.Getenv("TSS_PASSWORD"),
     },
     // Expecting either the tenant or URL to be set
-    Tenant:    os.Getenv("TSS_API_TENANT"),
+    Tenant:    os.Getenv("TSS_TENANT"),
     ServerURL: os.Getenv("TSS_SERVER_URL"),
 })
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 OR
@@ -44,26 +99,54 @@ OR
 Define a `Configuration`, use it to create an instance of `Server` for Platform:
 
 ```golang
-tss := server.New(server.Configuration{
-    Credentials: UserCredential{
+tss, err := server.New(server.Configuration{
+    Credentials: server.UserCredential{
         Username: os.Getenv("TSS_PLATFORM_USERNAME"),
         Password: os.Getenv("TSS_PLATFORM_PASSWORD"),
     },
     ServerURL: os.Getenv("TSS_PLATFORM_URL"),
 })
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 Get a secret by its numeric ID:
 
 ```golang
-s, err := tss.Secret(1)
+secret, err := tss.Secret(1)
 
 if err != nil {
-    log.Fatal("failure calling server.Secret", err)
+    log.Fatal("failure calling server.Secret: ", err)
 }
 
-if pw, ok := secret.Field("password"); ok {
-    fmt.Print("the password is", pw)
+if _, ok := secret.Field("password"); !ok {
+    log.Fatal("secret has no password field")
+}
+fmt.Printf("retrieved secret %d (%s)\n", secret.ID, secret.Name)
+```
+
+Long-running callers should pass their own operation deadline. The context covers
+health detection, authentication, retry backoff, the API request, and attachment reads:
+
+```golang
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+secret, err := tss.SecretContext(ctx, 1)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("retrieved secret %d (%s)\n", secret.ID, secret.Name)
+```
+
+Non-2xx responses return `*server.HTTPError`, whose `StatusCode` can be inspected
+without parsing its message:
+
+```golang
+var httpErr *server.HTTPError
+if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusTooManyRequests {
+    // Apply the application's rate-limit policy.
 }
 ```
 
@@ -83,16 +166,19 @@ fmt.Printf("Secret Name: %s\n", secret.Name)
 Create a Secret:
 
 ```golang
-secretModel := new(Secret)
+secretModel := new(server.Secret)
 secretModel.Name = "New Secret"
 secretModel.SiteID = 1
 secretModel.FolderID = 6
 secretModel.SecretTemplateID = 8
-secretModel.Fields = make([]SecretField, 1)
+secretModel.Fields = make([]server.SecretField, 1)
 secretModel.Fields[0].FieldID = 270
 secretModel.Fields[0].ItemValue = somePassword
 
 newSecret, err := tss.CreateSecret(*secretModel)
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 Update the Secret:
@@ -102,12 +188,18 @@ secretModel.ID = newSecret.ID
 secretModel.Fields[0].ItemValue = someNewPassword
 
 updatedSecret, err := tss.UpdateSecret(*secretModel)
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 Delete the Secret:
 
 ```golang
-err := tss.DeleteSecret(newSecret.ID)
+err := tss.DeleteSecret(updatedSecret.ID)
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 ## Logging
@@ -176,16 +268,56 @@ tss, err := server.New(server.Configuration{
 
 ## Test
 
+Unit tests need no configuration and no network:
+
+```sh
+go test ./...
+```
+
+The tests that exercise a real server form a battery: each case runs against every
+configured target as a subtest named for that target, so the battery is selectable per
+target.
+
+```sh
+go test ./server -run '/SecretServer'   # whole battery against Secret Server
+go test ./server -run '/Platform'       # whole battery against Platform
+go test ./server -run 'TestSecretCRUD'  # one case against every configured target
+go test ./server -v                     # everything available, naming what ran and what was skipped
+```
+
+A target runs when it is configured and is skipped otherwise, so `go test ./...`
+passes on a clean checkout. A target counts as configured when its config file is
+present or any of its environment variables is set — "any", not "all", so a partly
+configured target fails loudly instead of quietly skipping. Set
+`TSS_REQUIRE_SECRET_SERVER=1` or `TSS_REQUIRE_PLATFORM=1` to make one target and all of
+its case fixtures mandatory. `TSS_INTEGRATION=1` is shorthand for requiring both. CI
+sets the per-target flag when that target's primary credential is available, so one
+target cannot hide missing coverage for the other.
+
+Secret Server reads `../test_config.json` and the `TSS_*` variables; Platform reads
+`../test_config_platform.json` and the `TSS_PLATFORM_*` variables. The two files are
+separate so that the Platform subtests cannot silently run against a Secret Server.
+
+Cases that address a specific secret, folder, template, or search term are skipped
+unless the matching variable is set. In required mode those missing or unsuitable
+fixtures fail instead, rather than leaving a green run with silent gaps.
+
 The tests populate a `Configuration` from JSON:
 
 ```golang
-config := new(Configuration)
-
-if cj, err := ioutil.ReadFile("../test_config.json"); err == nil {
-    json.Unmarshal(cj, &config)
+var config server.Configuration
+cj, err := ioutil.ReadFile("../test_config.json")
+if err != nil {
+    log.Fatal(err)
+}
+if err := json.Unmarshal(cj, &config); err != nil {
+    log.Fatal(err)
 }
 
-tss := New(*config)
+tss, err := server.New(config)
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 `../test_config.json`:
@@ -196,7 +328,7 @@ tss := New(*config)
         "username": "my_app_user",
         "password": "Passw0rd."
     },
-    "serverURL": "http://example.local/SecretServer"
+    "serverURL": "https://example.local/SecretServer"
 }
 ```
 
@@ -211,6 +343,7 @@ The necessary configuration may also be configured from environment variables:
 | TSS_PLATFORM_USERNAME | The user name for the Platform user                                             |
 | TSS_PLATFORM_PASSWORD | The password for the Platform user                                             |
 | TSS_PLATFORM_URL | URL for Platform, eg: https://delinea.secureplatform.com/                                            |
+| TSS_PLATFORM_ALLOWED_VAULT_HOSTS | Comma-separated cross-origin vault hosts explicitly trusted for an on-premises Platform |
 
 ### Test #1 - Read Secret Password
 Reads the secret with ID `1` or the ID passed in the `TSS_SECRET_ID` environment variable

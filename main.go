@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 
@@ -27,7 +26,8 @@ func main() {
 		log.Fatal("Error calling server.Secret", err)
 	}
 
-	if pw, ok := s.Field("password"); ok {
-		fmt.Print("the password is", pw)
+	if _, ok := s.Field("password"); !ok {
+		log.Fatal("The secret has no password field")
 	}
+	log.Printf("Retrieved secret %d (%s)", s.ID, s.Name)
 }
