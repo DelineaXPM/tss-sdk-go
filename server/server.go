@@ -259,6 +259,10 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		}
 	}
 
+	// The base URL that keys the token cache, captured before getAccessToken runs,
+	// since Platform discovery rewrites ServerURL to the vault it found.
+	tokenBaseURL := s.baseURL()
+
 	accessToken, err := s.getAccessToken()
 
 	if err != nil {
@@ -284,14 +288,22 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 
 	data, statusCode, err := handleResponse(s.client().Do(req))
 
-	// Check for unauthorized or access denied. statusCode is nil on a transport
-	// error (e.g. a Timeout-induced context deadline), so guard before dereferencing.
-	if statusCode != nil && (statusCode.StatusCode == http.StatusUnauthorized || statusCode.StatusCode == http.StatusForbidden) {
-		s.clearTokenCache()
-		s.log().Printf("[ERROR] Token cache cleared due to unauthorized or access denied response.")
-	}
+	s.evictOnAuthFailure(statusCode, tokenBaseURL)
 
 	return data, err
+}
+
+// evictOnAuthFailure drops the cached token when the server rejects a request as
+// unauthorized or forbidden, so the next call re-authenticates instead of replaying a
+// token the server no longer honors. res is nil on a transport error. tokenBaseURL must
+// be the base URL captured before getAccessToken ran, since against a Platform,
+// discovery rewrites ServerURL to the vault it found.
+func (s Server) evictOnAuthFailure(res *http.Response, tokenBaseURL string) {
+	if res == nil || (res.StatusCode != http.StatusUnauthorized && res.StatusCode != http.StatusForbidden) {
+		return
+	}
+	s.clearTokenCacheFor(tokenBaseURL)
+	s.log().Printf("[ERROR] Token cache cleared due to unauthorized or access denied response.")
 }
 
 // searchResources uses the accessToken to search for API resources.
@@ -309,6 +321,8 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 
 	method := "GET"
 	body := bytes.NewBuffer([]byte{})
+
+	tokenBaseURL := s.baseURL()
 
 	accessToken, err := s.getAccessToken()
 
@@ -328,7 +342,9 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 
 	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
-	data, _, err := handleResponse(s.client().Do(req))
+	data, statusCode, err := handleResponse(s.client().Do(req))
+
+	s.evictOnAuthFailure(statusCode, tokenBaseURL)
 
 	return data, err
 }
@@ -339,6 +355,8 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	s.log().Printf("[DEBUG] uploading a file to the '%s' field with filename '%s'", fileField.Slug, fileField.Filename)
 	body := bytes.NewBuffer([]byte{})
 	path := fmt.Sprintf("%d/fields/%s", secretId, url.PathEscape(fileField.Slug))
+
+	tokenBaseURL := s.baseURL()
 
 	// Fetch the access token
 	accessToken, err := s.getAccessToken()
@@ -378,7 +396,9 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	s.log().Printf("[DEBUG] uploading file with PUT %s", req.URL.String())
-	_, _, err = handleResponse(s.client().Do(req))
+	_, statusCode, err := handleResponse(s.client().Do(req))
+
+	s.evictOnAuthFailure(statusCode, tokenBaseURL)
 
 	return err
 }
@@ -415,13 +435,26 @@ func (s *Server) getCacheAccessToken(baseURL string) (string, bool) {
 	if ok && time.Now().Unix() < int64(cache.ExpiresIn) {
 		return cache.AccessToken, true
 	}
-	s.clearTokenCache()
+	// Evict under the key that was just looked up, not under s.baseURL(): after
+	// Platform discovery rewrites ServerURL, the two name different entries, and
+	// clearing by the current base URL would drop a live token instead of the
+	// expired one this miss found.
+	s.clearTokenCacheFor(baseURL)
 	return "", false
 }
 
 func (s *Server) clearTokenCache() {
+	s.clearTokenCacheFor(s.baseURL())
+}
+
+// clearTokenCacheFor evicts the entry cached under an explicit base URL. Callers that
+// evict after a request must use this with the base URL captured *before*
+// getAccessToken ran: against a Platform, discovery rewrites ServerURL to the vault it
+// found, so s.baseURL() afterwards no longer names the key the token was stored under,
+// and clearing by it would leave the rejected token in place.
+func (s *Server) clearTokenCacheFor(baseURL string) {
 	tokenCacheMu.Lock()
-	delete(tokenCache, s.cacheKey(s.baseURL()))
+	delete(tokenCache, s.cacheKey(baseURL))
 	tokenCacheMu.Unlock()
 }
 
@@ -578,8 +611,17 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 	}
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 
-	data, _, err := handleResponse(s.client().Do(req))
+	data, vaultsResponse, err := handleResponse(s.client().Do(req))
 	if err != nil {
+		// This is the first use of the cached Platform token. If the Platform refuses
+		// it, evict it: otherwise a revoked or rotated token is served from cache for
+		// the rest of its lifetime and every call fails, because this error returns
+		// before accessResource's own eviction can run.
+		if vaultsResponse != nil && (vaultsResponse.StatusCode == http.StatusUnauthorized ||
+			vaultsResponse.StatusCode == http.StatusForbidden) {
+			s.clearTokenCacheFor(baseURL)
+			s.log().Printf("[ERROR] Platform rejected the cached token; cleared it so the next call re-authenticates.")
+		}
 		s.log().Print("[ERROR] get vaults response error:", err)
 		return "", err
 	}

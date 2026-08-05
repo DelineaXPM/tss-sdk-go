@@ -104,6 +104,43 @@ func TestTokenCacheExpiredEntryNotServed(t *testing.T) {
 	}
 }
 
+// A miss must evict only the key that was looked up. Keying the eviction on the current
+// base URL instead would, after Platform discovery rewrites ServerURL, drop the vault's
+// live token whenever a stale entry under the old URL is queried.
+func TestTokenCacheMissEvictsOnlyTheQueriedKey(t *testing.T) {
+	const platformURL = "https://cache-miss.example.com"
+	const vaultURL = "https://cache-miss-vault.example.com"
+	s, err := New(Configuration{ServerURL: platformURL, Credentials: UserCredential{Username: "gina"}})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	if err := s.setCacheAccessToken("vault-token", 3600, vaultURL); err != nil {
+		t.Fatalf("setCacheAccessToken (vault) returned error: %v", err)
+	}
+	// Seeded last: setCacheAccessToken sweeps entries that are already expired, and
+	// this one must still be in the map when the lookup below misses on it.
+	if err := s.setCacheAccessToken("expired-token", 0, platformURL); err != nil {
+		t.Fatalf("setCacheAccessToken (platform) returned error: %v", err)
+	}
+	s.ServerURL = vaultURL
+
+	if _, ok := s.getCacheAccessToken(platformURL); ok {
+		t.Fatal("an expired entry was served from the cache")
+	}
+
+	tokenCacheMu.Lock()
+	_, expiredRemains := tokenCache[s.cacheKey(platformURL)]
+	tokenCacheMu.Unlock()
+	if expiredRemains {
+		t.Error("the expired entry survived the miss that found it")
+	}
+
+	if got, ok := s.getCacheAccessToken(vaultURL); !ok || got != "vault-token" {
+		t.Errorf("vault cache = (%q, %v), want (%q, true); the miss evicted the wrong key", got, ok, "vault-token")
+	}
+}
+
 // Expired entries are otherwise deleted only when their exact key is queried again, and
 // a key embeds the credential digest, so entries orphaned by a password rotation would
 // grow the package-level map for the life of the process.
