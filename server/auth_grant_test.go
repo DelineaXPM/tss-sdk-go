@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -104,6 +105,194 @@ func TestGetAccessTokenReusesCachedToken(t *testing.T) {
 	}
 	if *tokenRequests != 1 {
 		t.Errorf("sent %d grant requests, want 1 (the second call should hit the cache)", *tokenRequests)
+	}
+}
+
+func TestConcurrentColdCacheUsesOneGrant(t *testing.T) {
+	const callers = 32
+	var mu sync.Mutex
+	healthChecks := 0
+	grantRequests := 0
+	allProbed := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/api/v1/healthcheck"):
+			mu.Lock()
+			healthChecks++
+			if healthChecks == callers {
+				close(allProbed)
+			}
+			mu.Unlock()
+			fmt.Fprint(w, `{"healthy":true}`)
+		case strings.HasSuffix(r.URL.Path, "/oauth2/token"):
+			mu.Lock()
+			grantRequests++
+			mu.Unlock()
+			<-allProbed
+			fmt.Fprint(w, `{"access_token":"shared-token","token_type":"bearer","expires_in":3600}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	s, err := New(Configuration{ServerURL: ts.URL, Credentials: UserCredential{Username: "concurrent", Password: "pw"}})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		serverCopy := *s
+		go func() {
+			<-start
+			token, err := serverCopy.getAccessToken()
+			if err == nil && token != "shared-token" {
+				err = fmt.Errorf("token = %q, want shared-token", token)
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < callers; i++ {
+		if err := <-results; err != nil {
+			t.Errorf("caller %d: %v", i, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if grantRequests != 1 {
+		t.Errorf("grant requests = %d, want 1", grantRequests)
+	}
+}
+
+func TestFailedGrantWakesWaitersAndNextCallRetries(t *testing.T) {
+	const callers = 16
+	var mu sync.Mutex
+	healthChecks := 0
+	grantRequests := 0
+	allProbed := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/api/v1/healthcheck"):
+			mu.Lock()
+			healthChecks++
+			if healthChecks == callers {
+				close(allProbed)
+			}
+			mu.Unlock()
+			fmt.Fprint(w, `{"healthy":true}`)
+		case strings.HasSuffix(r.URL.Path, "/oauth2/token"):
+			mu.Lock()
+			grantRequests++
+			requestNumber := grantRequests
+			mu.Unlock()
+			if requestNumber == 1 {
+				<-allProbed
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprint(w, "temporary grant failure")
+				return
+			}
+			fmt.Fprint(w, `{"access_token":"recovered-token","token_type":"bearer","expires_in":3600}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+	s, err := New(Configuration{ServerURL: ts.URL, Credentials: UserCredential{Username: "waiters", Password: "pw"}})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	results := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		serverCopy := *s
+		go func() {
+			_, err := serverCopy.getAccessToken()
+			results <- err
+		}()
+	}
+	var firstMessage string
+	failures := 0
+	for i := 0; i < callers; i++ {
+		err := <-results
+		if err == nil {
+			// A caller scheduled after the failed flight was removed may legitimately
+			// join the single recovery flight instead of observing the earlier error.
+			continue
+		}
+		failures++
+		if firstMessage == "" {
+			firstMessage = err.Error()
+		} else if err.Error() != firstMessage {
+			t.Errorf("caller %d error = %q, want shared %q", i, err, firstMessage)
+		}
+	}
+	if failures == 0 {
+		t.Fatal("no caller observed the failed grant")
+	}
+	mu.Lock()
+	if grantRequests < 1 || grantRequests > 2 {
+		t.Errorf("concurrent batch made %d grants, want one failure and at most one recovery", grantRequests)
+	}
+	mu.Unlock()
+
+	if token, err := s.getAccessToken(); err != nil || token != "recovered-token" {
+		t.Fatalf("call after failed flight = (%q, %v), want recovered-token", token, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if grantRequests != 2 {
+		t.Errorf("grant requests after recovery = %d, want 2", grantRequests)
+	}
+}
+
+func TestDifferentTokenKeysGrantConcurrently(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/api/v1/healthcheck") {
+			fmt.Fprint(w, `{"healthy":true}`)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/oauth2/token") {
+			started <- struct{}{}
+			<-release
+			fmt.Fprint(w, `{"access_token":"token","token_type":"bearer","expires_in":3600}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	servers := make([]*Server, 2)
+	for i := range servers {
+		var err error
+		servers[i], err = New(Configuration{ServerURL: ts.URL, Credentials: UserCredential{Username: fmt.Sprintf("user-%d", i), Password: "pw"}})
+		if err != nil {
+			t.Fatalf("New returned error: %v", err)
+		}
+	}
+	done := make(chan error, 2)
+	for _, s := range servers {
+		go func(s *Server) {
+			_, err := s.getAccessToken()
+			done <- err
+		}(s)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			close(release)
+			t.Fatal("different cache keys serialized their token grants")
+		}
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Errorf("grant returned error: %v", err)
+		}
 	}
 }
 

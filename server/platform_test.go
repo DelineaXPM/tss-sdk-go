@@ -58,8 +58,8 @@ func TestCheckPlatformDetailsSelectsDefaultActiveVault(t *testing.T) {
 	if !details.isPlatform {
 		t.Error("checkPlatformDetails did not identify the Platform")
 	}
-	if details.accessToken != "platform-token" {
-		t.Errorf("token = %q, want %q", details.accessToken, "platform-token")
+	if details.accessToken.value != "platform-token" {
+		t.Errorf("token = %q, want %q", details.accessToken.value, "platform-token")
 	}
 	if s.ServerURL != "https://vault.example.com" {
 		t.Errorf("ServerURL = %q, want the default and active vault %q", s.ServerURL, "https://vault.example.com")

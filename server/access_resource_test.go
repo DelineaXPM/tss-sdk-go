@@ -126,6 +126,61 @@ func TestSearchAndUploadClearTokenCacheOnAuthFailure(t *testing.T) {
 	}
 }
 
+func TestSuppliedTokenFailureDoesNotEvictPasswordGrantCache(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	s, err := New(Configuration{
+		ServerURL: ts.URL,
+		Credentials: UserCredential{
+			Username: "frank",
+			Password: "pw",
+			Token:    "caller-supplied-token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if err := s.setCacheAccessToken("password-grant-token", 3600, ts.URL); err != nil {
+		t.Fatalf("setCacheAccessToken returned error: %v", err)
+	}
+
+	if _, err := s.accessResource(http.MethodGet, "secrets", "1", nil); err == nil {
+		t.Fatal("expected the supplied token to be rejected")
+	}
+	if token, found := s.getCacheAccessToken(ts.URL); !found || token != "password-grant-token" {
+		t.Errorf("password-grant cache = (%q, %v), want it unchanged", token, found)
+	}
+}
+
+func TestLateAuthFailureDoesNotEvictNewerToken(t *testing.T) {
+	s, err := New(Configuration{ServerURL: "https://cache-generation.example.com", Credentials: UserCredential{Username: "frank", Password: "pw"}})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	oldToken, err := s.storeCacheAccessToken("old-token", 3600, s.baseURL())
+	if err != nil {
+		t.Fatalf("storing old token: %v", err)
+	}
+	newToken, err := s.storeCacheAccessToken("new-token", 3600, s.baseURL())
+	if err != nil {
+		t.Fatalf("storing new token: %v", err)
+	}
+	authFailure := &http.Response{StatusCode: http.StatusUnauthorized}
+
+	s.evictOnAuthFailure(authFailure, oldToken)
+	if token, found := s.getCacheAccessToken(s.baseURL()); !found || token != "new-token" {
+		t.Errorf("new cache entry = (%q, %v), want it to survive an old request's 401", token, found)
+	}
+
+	s.evictOnAuthFailure(authFailure, newToken)
+	if _, found := s.getCacheAccessToken(s.baseURL()); found {
+		t.Error("the generation actually rejected by the server was not evicted")
+	}
+}
+
 // TestAccessResourceRejectsUnknownResource verifies the resource allowlist: only the
 // secrets and secret-templates resources may be addressed, so a caller cannot steer a
 // credentialed request at an arbitrary API path. The rejection must happen before any

@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -79,6 +81,9 @@ func init() {
 	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
 		cloned := transport.Clone()
 		cloned.CloseIdleConnections()
+	}
+	if _, err := io.ReadFull(rand.Reader, passwordDigestKey[:]); err != nil {
+		panic(fmt.Sprintf("server: initializing token-cache key: %v", err))
 	}
 }
 
@@ -179,6 +184,32 @@ type Server struct {
 type TokenCache struct {
 	AccessToken string `json:"access_token"`
 	ExpiresIn   int    `json:"expires_in"`
+	generation  uint64
+}
+
+type tokenSource uint8
+
+const (
+	tokenSourceSupplied tokenSource = iota
+	tokenSourceCache
+)
+
+type accessTokenDetails struct {
+	value      string
+	cacheKey   string
+	generation uint64
+	source     tokenSource
+}
+
+type tokenGrant struct {
+	accessToken string
+	expiresIn   int
+}
+
+type tokenFlight struct {
+	done  chan struct{}
+	token accessTokenDetails
+	err   error
 }
 
 // tokenCache holds cached access tokens in process memory, keyed by cacheKey.
@@ -187,9 +218,14 @@ type TokenCache struct {
 // process environment (CWE-526). An in-memory store keeps the intra-process
 // reuse and the per-URL/per-credential collision keying without that exposure.
 var (
-	tokenCacheMu sync.Mutex
-	tokenCache   = map[string]TokenCache{}
+	tokenCacheMu        sync.Mutex
+	tokenCache          = map[string]TokenCache{}
+	tokenFlights        = map[string]*tokenFlight{}
+	nextTokenGeneration uint64
+	passwordDigestKey   [32]byte
 )
+
+const maxTokenCacheEntries = 1024
 
 // New returns an initialized Secrets object
 func New(config Configuration) (*Server, error) {
@@ -393,11 +429,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		}
 	}
 
-	// The base URL that keys the token cache, captured before getAccessToken runs,
-	// since Platform discovery rewrites ServerURL to the vault it found.
-	tokenBaseURL := s.baseURL()
-
-	accessToken, err := s.getAccessToken()
+	accessToken, err := s.getAccessTokenDetails()
 
 	if err != nil {
 		s.log().Print("[ERROR] error getting accessToken:", err)
@@ -411,7 +443,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		return nil, err
 	}
 
-	req.Header.Add("Authorization", "Bearer "+accessToken)
+	req.Header.Add("Authorization", "Bearer "+accessToken.value)
 
 	switch method {
 	case "POST", "PUT", "PATCH":
@@ -422,22 +454,22 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 
 	data, statusCode, err := s.handleResponse(s.client().Do(req))
 
-	s.evictOnAuthFailure(statusCode, tokenBaseURL)
+	s.evictOnAuthFailure(statusCode, accessToken)
 
 	return data, err
 }
 
 // evictOnAuthFailure drops the cached token when the server rejects a request as
 // unauthorized or forbidden, so the next call re-authenticates instead of replaying a
-// token the server no longer honors. res is nil on a transport error. tokenBaseURL must
-// be the base URL captured before getAccessToken ran, since against a Platform,
-// discovery rewrites ServerURL to the vault it found.
-func (s Server) evictOnAuthFailure(res *http.Response, tokenBaseURL string) {
+// token the server no longer honors. Supplied tokens are caller-owned and never touch
+// the password-grant cache. res is nil on a transport error.
+func (s Server) evictOnAuthFailure(res *http.Response, token accessTokenDetails) {
 	if res == nil || (res.StatusCode != http.StatusUnauthorized && res.StatusCode != http.StatusForbidden) {
 		return
 	}
-	s.clearTokenCacheFor(tokenBaseURL)
-	s.log().Printf("[ERROR] Token cache cleared due to unauthorized or access denied response.")
+	if s.clearTokenCacheIfCurrent(token) {
+		s.log().Printf("[ERROR] Token cache cleared due to unauthorized or access denied response.")
+	}
 }
 
 // searchResources uses the accessToken to search for API resources.
@@ -456,9 +488,7 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 	method := "GET"
 	body := bytes.NewBuffer([]byte{})
 
-	tokenBaseURL := s.baseURL()
-
-	accessToken, err := s.getAccessToken()
+	accessToken, err := s.getAccessTokenDetails()
 
 	if err != nil {
 		s.log().Print("[ERROR] error getting accessToken:", err)
@@ -472,13 +502,13 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 		return nil, err
 	}
 
-	req.Header.Add("Authorization", "Bearer "+accessToken)
+	req.Header.Add("Authorization", "Bearer "+accessToken.value)
 
 	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
 	data, statusCode, err := s.handleResponse(s.client().Do(req))
 
-	s.evictOnAuthFailure(statusCode, tokenBaseURL)
+	s.evictOnAuthFailure(statusCode, accessToken)
 
 	return data, err
 }
@@ -490,10 +520,8 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	body := bytes.NewBuffer([]byte{})
 	path := fmt.Sprintf("%d/fields/%s", secretId, url.PathEscape(fileField.Slug))
 
-	tokenBaseURL := s.baseURL()
-
 	// Fetch the access token
-	accessToken, err := s.getAccessToken()
+	accessToken, err := s.getAccessTokenDetails()
 	if err != nil {
 		s.log().Print("[ERROR] error getting accessToken:", err)
 		return err
@@ -527,17 +555,22 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Add("Authorization", "Bearer "+accessToken)
+	req.Header.Add("Authorization", "Bearer "+accessToken.value)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	s.log().Printf("[DEBUG] uploading file with PUT %s", req.URL.String())
 	_, statusCode, err := s.handleResponse(s.client().Do(req))
 
-	s.evictOnAuthFailure(statusCode, tokenBaseURL)
+	s.evictOnAuthFailure(statusCode, accessToken)
 
 	return err
 }
 
 func (s *Server) setCacheAccessToken(value string, expiresIn int, baseURL string) error {
+	_, err := s.storeCacheAccessToken(value, expiresIn, baseURL)
+	return err
+}
+
+func (s *Server) storeCacheAccessToken(value string, expiresIn int, baseURL string) (accessTokenDetails, error) {
 	cache := TokenCache{}
 	cache.AccessToken = value
 	// Serve the cached token for 90% of its lifetime, refreshing before it
@@ -546,7 +579,9 @@ func (s *Server) setCacheAccessToken(value string, expiresIn int, baseURL string
 	// lifetime, forcing ~10x more credential round trips than necessary.
 	cache.ExpiresIn = int(time.Now().Unix()) + int(math.Floor(float64(expiresIn)*0.9))
 
+	key := s.cacheKey(baseURL)
 	tokenCacheMu.Lock()
+	defer tokenCacheMu.Unlock()
 	// Sweep expired entries while holding the lock: an entry is otherwise deleted
 	// only when its exact key is queried again, and a key embeds the credential
 	// digest, so entries orphaned by a password rotation would accumulate for the
@@ -557,24 +592,93 @@ func (s *Server) setCacheAccessToken(value string, expiresIn int, baseURL string
 			delete(tokenCache, key)
 		}
 	}
-	tokenCache[s.cacheKey(baseURL)] = cache
-	tokenCacheMu.Unlock()
-	return nil
+	if _, replacing := tokenCache[key]; !replacing && len(tokenCache) >= maxTokenCacheEntries {
+		evictOldestTokenLocked()
+	}
+	nextTokenGeneration++
+	cache.generation = nextTokenGeneration
+	tokenCache[key] = cache
+	return accessTokenDetails{
+		value:      cache.AccessToken,
+		cacheKey:   key,
+		generation: cache.generation,
+		source:     tokenSourceCache,
+	}, nil
 }
 
 func (s *Server) getCacheAccessToken(baseURL string) (string, bool) {
+	token, ok := s.getCachedToken(baseURL)
+	return token.value, ok
+}
+
+func (s *Server) getCachedToken(baseURL string) (accessTokenDetails, bool) {
+	key := s.cacheKey(baseURL)
 	tokenCacheMu.Lock()
-	cache, ok := tokenCache[s.cacheKey(baseURL)]
-	tokenCacheMu.Unlock()
+	defer tokenCacheMu.Unlock()
+	cache, ok := tokenCache[key]
 	if ok && time.Now().Unix() < int64(cache.ExpiresIn) {
-		return cache.AccessToken, true
+		return accessTokenDetails{
+			value:      cache.AccessToken,
+			cacheKey:   key,
+			generation: cache.generation,
+			source:     tokenSourceCache,
+		}, true
 	}
 	// Evict under the key that was just looked up, not under s.baseURL(): after
 	// Platform discovery rewrites ServerURL, the two name different entries, and
 	// clearing by the current base URL would drop a live token instead of the
 	// expired one this miss found.
-	s.clearTokenCacheFor(baseURL)
-	return "", false
+	delete(tokenCache, key)
+	return accessTokenDetails{}, false
+}
+
+func evictOldestTokenLocked() {
+	var oldestKey string
+	oldestExpiry := int(^uint(0) >> 1)
+	for key, cache := range tokenCache {
+		if oldestKey == "" || cache.ExpiresIn < oldestExpiry {
+			oldestKey = key
+			oldestExpiry = cache.ExpiresIn
+		}
+	}
+	if oldestKey != "" {
+		delete(tokenCache, oldestKey)
+	}
+}
+
+// cachedOrGrantToken coalesces concurrent cache misses for one credential key. The
+// grant runs without the global cache lock, so unrelated servers and credentials can
+// authenticate concurrently. Waiters receive the exact generation stored by the
+// leader, which later makes auth-failure eviction compare-and-delete safe.
+func (s *Server) cachedOrGrantToken(baseURL string, grant func() (tokenGrant, error)) (accessTokenDetails, error) {
+	key := s.cacheKey(baseURL)
+	now := time.Now().Unix()
+	tokenCacheMu.Lock()
+	if cached, ok := tokenCache[key]; ok && now < int64(cached.ExpiresIn) {
+		tokenCacheMu.Unlock()
+		return accessTokenDetails{value: cached.AccessToken, cacheKey: key, generation: cached.generation, source: tokenSourceCache}, nil
+	}
+	delete(tokenCache, key)
+	if flight, ok := tokenFlights[key]; ok {
+		tokenCacheMu.Unlock()
+		<-flight.done
+		return flight.token, flight.err
+	}
+	flight := &tokenFlight{done: make(chan struct{})}
+	tokenFlights[key] = flight
+	tokenCacheMu.Unlock()
+
+	granted, err := grant()
+	if err == nil {
+		flight.token, err = s.storeCacheAccessToken(granted.accessToken, granted.expiresIn, baseURL)
+	}
+	flight.err = err
+
+	tokenCacheMu.Lock()
+	delete(tokenFlights, key)
+	close(flight.done)
+	tokenCacheMu.Unlock()
+	return flight.token, flight.err
 }
 
 func (s *Server) clearTokenCache() {
@@ -590,6 +694,23 @@ func (s *Server) clearTokenCacheFor(baseURL string) {
 	tokenCacheMu.Lock()
 	delete(tokenCache, s.cacheKey(baseURL))
 	tokenCacheMu.Unlock()
+}
+
+// clearTokenCacheIfCurrent removes only the cache generation actually used by a
+// rejected request. A delayed 401 for an older token must not evict a newer token that
+// another goroutine has already refreshed.
+func (s *Server) clearTokenCacheIfCurrent(token accessTokenDetails) bool {
+	if token.source != tokenSourceCache || token.cacheKey == "" {
+		return false
+	}
+	tokenCacheMu.Lock()
+	defer tokenCacheMu.Unlock()
+	cached, ok := tokenCache[token.cacheKey]
+	if !ok || cached.generation != token.generation {
+		return false
+	}
+	delete(tokenCache, token.cacheKey)
+	return true
 }
 
 // cacheKey returns an in-memory cache key unique to the base URL and the whole
@@ -612,81 +733,76 @@ func (s *Server) cacheKey(baseURL string) string {
 		"&" + passwordDigest(s.Credentials.Password)
 }
 
-// passwordDigest reduces a password to something that can key a cache entry without
-// being the password: the key lives in a package-level map for the life of the
-// process, which is not somewhere a credential should sit in cleartext (the same
-// reasoning that moved the token itself out of the environment). The digest is
-// unsalted, which is not password storage and is not meant to be: the plaintext is
-// already in this process's memory, in Credentials, so the digest adds no exposure it
-// does not already have. It exists to distinguish credentials, not to protect them.
+// passwordDigest uses a process-random HMAC key so a memory disclosure of cache keys
+// does not turn each key into a reusable offline verifier for a low-entropy password.
+// It still deterministically distinguishes credentials within this process.
 func passwordDigest(password string) string {
-	sum := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(sum[:])
+	digest := hmac.New(sha256.New, passwordDigestKey[:])
+	_, _ = digest.Write([]byte(password))
+	return hex.EncodeToString(digest.Sum(nil))
 }
 
 // getAccessToken gets an OAuth2 Access Grant and returns the token
 // endpoint and get an accessGrant.
 func (s *Server) getAccessToken() (string, error) {
+	token, err := s.getAccessTokenDetails()
+	return token.value, err
+}
+
+func (s *Server) getAccessTokenDetails() (accessTokenDetails, error) {
 	if s.Credentials.Token != "" {
-		return s.Credentials.Token, nil
+		return accessTokenDetails{value: s.Credentials.Token, source: tokenSourceSupplied}, nil
 	}
 	baseURL := s.baseURL()
 
 	details, err := s.checkPlatformDetails(baseURL)
 	if err != nil {
 		s.log().Print("Error while checking server details:", err)
-		return "", err
+		return accessTokenDetails{}, err
 	}
 
 	if !details.isPlatform {
-		accessToken, found := s.getCacheAccessToken(baseURL)
-		if found {
-			return accessToken, nil
-		}
+		return s.cachedOrGrantToken(baseURL, func() (tokenGrant, error) {
+			values := url.Values{
+				"username":   {s.Credentials.Username},
+				"password":   {s.Credentials.Password},
+				"grant_type": {"password"},
+			}
+			if s.Credentials.Domain != "" {
+				values["domain"] = []string{s.Credentials.Domain}
+			}
 
-		values := url.Values{
-			"username":   {s.Credentials.Username},
-			"password":   {s.Credentials.Password},
-			"grant_type": {"password"},
-		}
-		if s.Credentials.Domain != "" {
-			values["domain"] = []string{s.Credentials.Domain}
-		}
+			requestURL := s.urlFor("token", "")
+			req, err := http.NewRequest(http.MethodPost, requestURL, strings.NewReader(values.Encode()))
+			if err != nil {
+				return tokenGrant{}, fmt.Errorf("creating token request: %w", err)
+			}
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req = withoutRedirects(req)
+			response, requestErr := s.client().Do(req)
+			data, _, err := s.handleResponseWithLimit(response, requestErr, maxAuthenticationResponseBytes)
 
-		requestURL := s.urlFor("token", "")
-		req, err := http.NewRequest(http.MethodPost, requestURL, strings.NewReader(values.Encode()))
-		if err != nil {
-			return "", fmt.Errorf("creating token request: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req = withoutRedirects(req)
-		response, requestErr := s.client().Do(req)
-		data, _, err := s.handleResponseWithLimit(response, requestErr, maxAuthenticationResponseBytes)
+			if err != nil {
+				s.log().Print("[ERROR] grant response error:", err)
+				return tokenGrant{}, err
+			}
 
-		if err != nil {
-			s.log().Print("[ERROR] grant response error:", err)
-			return "", err
-		}
+			grant := struct {
+				AccessToken  string `json:"access_token"`
+				RefreshToken string `json:"refresh_token"`
+				TokenType    string `json:"token_type"`
+				ExpiresIn    int    `json:"expires_in"`
+			}{}
 
-		grant := struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-			TokenType    string `json:"token_type"`
-			ExpiresIn    int    `json:"expires_in"`
-		}{}
-
-		if err = json.Unmarshal(data, &grant); err != nil {
-			s.log().Print("[ERROR] parsing grant response:", err)
-			return "", err
-		}
-		if err = validateTokenGrant(grant.AccessToken, grant.TokenType, grant.ExpiresIn); err != nil {
-			return "", fmt.Errorf("invalid token response from %s: %w", requestURL, err)
-		}
-		if err = s.setCacheAccessToken(grant.AccessToken, grant.ExpiresIn, baseURL); err != nil {
-			s.log().Print("[ERROR] caching access token:", err)
-			return "", err
-		}
-		return grant.AccessToken, nil
+			if err = json.Unmarshal(data, &grant); err != nil {
+				s.log().Print("[ERROR] parsing grant response:", err)
+				return tokenGrant{}, err
+			}
+			if err = validateTokenGrant(grant.AccessToken, grant.TokenType, grant.ExpiresIn); err != nil {
+				return tokenGrant{}, fmt.Errorf("invalid token response from %s: %w", requestURL, err)
+			}
+			return tokenGrant{accessToken: grant.AccessToken, expiresIn: grant.ExpiresIn}, nil
+		})
 	}
 
 	return details.accessToken, nil
@@ -694,7 +810,7 @@ func (s *Server) getAccessToken() (string, error) {
 
 type platformDetails struct {
 	isPlatform  bool
-	accessToken string
+	accessToken accessTokenDetails
 }
 
 func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
@@ -717,8 +833,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 		return platformDetails{}, healthCheckError(ssHealthCheckUrl, ssErr, platformHelthCheckUrl, platformErr)
 	}
 
-	accessToken, found := s.getCacheAccessToken(baseURL)
-	if !found {
+	accessToken, err := s.cachedOrGrantToken(baseURL, func() (tokenGrant, error) {
 		requestData := url.Values{}
 		requestData.Set("grant_type", "client_credentials")
 		requestData.Set("client_id", s.Credentials.Username)
@@ -728,7 +843,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 		req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
 		if err != nil {
 			s.log().Print("Error creating HTTP request:", err)
-			return platformDetails{}, err
+			return tokenGrant{}, err
 		}
 
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -738,23 +853,21 @@ func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 		data, _, err := s.handleResponseWithLimit(response, requestErr, maxAuthenticationResponseBytes)
 		if err != nil {
 			s.log().Print("[ERROR] get token response error:", err)
-			return platformDetails{}, err
+			return tokenGrant{}, err
 		}
 
 		var tokenjsonResponse OAuthTokens
 		if err = json.Unmarshal(data, &tokenjsonResponse); err != nil {
 			s.log().Print("[ERROR] parsing get token response:", err)
-			return platformDetails{}, err
+			return tokenGrant{}, err
 		}
 		if err = validateTokenGrant(tokenjsonResponse.AccessToken, tokenjsonResponse.TokenType, tokenjsonResponse.ExpiresIn); err != nil {
-			return platformDetails{}, fmt.Errorf("invalid Platform token response: %w", err)
+			return tokenGrant{}, fmt.Errorf("invalid Platform token response: %w", err)
 		}
-		accessToken = tokenjsonResponse.AccessToken
-
-		if err = s.setCacheAccessToken(tokenjsonResponse.AccessToken, tokenjsonResponse.ExpiresIn, baseURL); err != nil {
-			s.log().Print("[ERROR] caching access token:", err)
-			return platformDetails{}, err
-		}
+		return tokenGrant{accessToken: tokenjsonResponse.AccessToken, expiresIn: tokenjsonResponse.ExpiresIn}, nil
+	})
+	if err != nil {
+		return platformDetails{}, err
 	}
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
@@ -762,7 +875,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 		s.log().Print("Error creating HTTP request:", err)
 		return platformDetails{}, err
 	}
-	req.Header.Add("Authorization", "Bearer "+accessToken)
+	req.Header.Add("Authorization", "Bearer "+accessToken.value)
 
 	response, requestErr := s.client().Do(req)
 	data, vaultsResponse, err := s.handleResponseWithLimit(response, requestErr, maxMetadataResponseBytes)
@@ -773,8 +886,9 @@ func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 		// before accessResource's own eviction can run.
 		if vaultsResponse != nil && (vaultsResponse.StatusCode == http.StatusUnauthorized ||
 			vaultsResponse.StatusCode == http.StatusForbidden) {
-			s.clearTokenCacheFor(baseURL)
-			s.log().Printf("[ERROR] Platform rejected the cached token; cleared it so the next call re-authenticates.")
+			if s.clearTokenCacheIfCurrent(accessToken) {
+				s.log().Printf("[ERROR] Platform rejected the cached token; cleared it so the next call re-authenticates.")
+			}
 		}
 		s.log().Print("[ERROR] get vaults response error:", err)
 		return platformDetails{}, err
