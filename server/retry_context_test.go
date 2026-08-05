@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,7 +88,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		StatusCode: http.StatusOK,
 		Status:     "200 OK",
 		Header:     make(http.Header),
-		Body:       ioutil.NopCloser(strings.NewReader(`{"id":2,"fields":[]}`)),
+		Body:       io.NopCloser(strings.NewReader(`{"id":2,"fields":[]}`)),
 		Request:    req,
 	}, nil
 }

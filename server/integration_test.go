@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
@@ -115,7 +114,7 @@ func (tgt target) server(t *testing.T) *Server {
 	t.Helper()
 
 	config := tgt.envConfig()
-	if cj, err := ioutil.ReadFile(tgt.configFile); err == nil {
+	if cj, err := os.ReadFile(tgt.configFile); err == nil {
 		config = Configuration{}
 		if err := json.Unmarshal(cj, &config); err != nil {
 			t.Fatalf("parsing %s: %v", tgt.configFile, err)

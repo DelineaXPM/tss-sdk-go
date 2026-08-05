@@ -400,6 +400,12 @@ func shouldRetryResponse(ctx context.Context, response *http.Response, err error
 	}
 	if err != nil {
 		var networkError net.Error
+		// Temporary is deprecated because the standard library cannot define it
+		// precisely, but a net.Error that reports itself temporary is exactly the
+		// class a safe read should retry, and dropping the check would silently
+		// narrow retry coverage for connection resets. Retrying is safe here
+		// regardless: only GET and HEAD reach this function.
+		//lint:ignore SA1019 deliberate; see above
 		return errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) ||
 			errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 	}
@@ -1172,7 +1178,7 @@ func (s *Server) isAllowedVaultHost(vaultURL *url.URL) bool {
 func healthCheckError(ssURL string, ssErr error, platformURL string, platformErr error) error {
 	switch {
 	case ssErr != nil && platformErr != nil:
-		return fmt.Errorf("could not reach Secret Server at %s (%v) or Platform at %s: %w", ssURL, ssErr, platformURL, platformErr)
+		return fmt.Errorf("could not reach Secret Server at %s (%w) or Platform at %s: %w", ssURL, ssErr, platformURL, platformErr)
 	case ssErr != nil:
 		return fmt.Errorf("could not reach Secret Server at %s: %w (Platform at %s responded but did not report healthy)", ssURL, ssErr, platformURL)
 	case platformErr != nil:

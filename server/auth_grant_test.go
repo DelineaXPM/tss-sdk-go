@@ -2,7 +2,7 @@ package server
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -25,7 +25,7 @@ func grantFixture(t *testing.T, credentials UserCredential) (*Server, *[]url.Val
 			fmt.Fprint(w, `{"healthy":true}`)
 		case strings.HasSuffix(r.URL.Path, "/oauth2/token"):
 			tokenRequests++
-			body, _ := ioutil.ReadAll(r.Body)
+			body, _ := io.ReadAll(r.Body)
 			values, err := url.ParseQuery(string(body))
 			if err != nil {
 				t.Errorf("unparseable grant body %q: %v", body, err)
@@ -142,7 +142,7 @@ func TestConcurrentColdCacheUsesOneGrant(t *testing.T) {
 	}
 	start := make(chan struct{})
 	results := make(chan error, callers)
-	for i := 0; i < callers; i++ {
+	for range callers {
 		serverCopy := *s
 		go func() {
 			<-start
@@ -205,7 +205,7 @@ func TestFailedGrantWakesWaitersAndNextCallRetries(t *testing.T) {
 	}
 
 	results := make(chan error, callers)
-	for i := 0; i < callers; i++ {
+	for range callers {
 		serverCopy := *s
 		go func() {
 			_, err := serverCopy.getAccessToken()
@@ -280,7 +280,7 @@ func TestDifferentTokenKeysGrantConcurrently(t *testing.T) {
 			done <- err
 		}(s)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-started:
 		case <-time.After(2 * time.Second):
@@ -289,7 +289,7 @@ func TestDifferentTokenKeysGrantConcurrently(t *testing.T) {
 		}
 	}
 	close(release)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := <-done; err != nil {
 			t.Errorf("grant returned error: %v", err)
 		}

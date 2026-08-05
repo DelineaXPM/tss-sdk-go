@@ -3,7 +3,6 @@ package server
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net/http"
 	"strings"
@@ -70,7 +69,7 @@ func (s Server) handleResponseWithLimit(res *http.Response, err error, limit int
 	}
 	defer res.Body.Close()
 
-	data, err := ioutil.ReadAll(io.LimitReader(res.Body, limit+1))
+	data, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
 
 	if err != nil {
 		return nil, res, err

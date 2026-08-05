@@ -2,7 +2,7 @@ package server
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -31,7 +31,7 @@ func newFixture(t *testing.T, routes func(w http.ResponseWriter, r *http.Request
 	t.Helper()
 	f := &fixture{}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := ioutil.ReadAll(r.Body)
+		body, _ := io.ReadAll(r.Body)
 		f.requests = append(f.requests, recordedRequest{
 			method:      r.Method,
 			path:        r.URL.Path,

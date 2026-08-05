@@ -327,7 +327,7 @@ func TestLiveConcurrentCallsShareOneToken(t *testing.T) {
 		const callers = 6
 		var wg sync.WaitGroup
 		failures := make(chan error, callers)
-		for i := 0; i < callers; i++ {
+		for range callers {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()

@@ -3,7 +3,6 @@ package server
 import (
 	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"testing"
@@ -42,7 +41,7 @@ func TestHandleResponseTruncatesLongErrorBody(t *testing.T) {
 	res := &http.Response{
 		StatusCode: http.StatusBadRequest,
 		Status:     "400 Bad Request",
-		Body:       ioutil.NopCloser(strings.NewReader(strings.Repeat("a", 4000))),
+		Body:       io.NopCloser(strings.NewReader(strings.Repeat("a", 4000))),
 	}
 
 	_, _, err := Server{}.handleResponse(res, nil)
@@ -64,7 +63,7 @@ func TestHandleResponseKeepsShortErrorBody(t *testing.T) {
 	res := &http.Response{
 		StatusCode: http.StatusForbidden,
 		Status:     "403 Forbidden",
-		Body:       ioutil.NopCloser(strings.NewReader(`{"errorCode":"API_AccessDenied"}`)),
+		Body:       io.NopCloser(strings.NewReader(`{"errorCode":"API_AccessDenied"}`)),
 	}
 
 	_, _, err := Server{}.handleResponse(res, nil)
@@ -90,7 +89,7 @@ func TestHandleResponseSanitizesErrorControlCharacters(t *testing.T) {
 	res := &http.Response{
 		StatusCode: http.StatusBadGateway,
 		Status:     "502 Bad Gateway",
-		Body:       ioutil.NopCloser(strings.NewReader("first\nforged-log-line")),
+		Body:       io.NopCloser(strings.NewReader("first\nforged-log-line")),
 		Header:     make(http.Header),
 	}
 	_, _, err := Server{}.handleResponse(res, nil)

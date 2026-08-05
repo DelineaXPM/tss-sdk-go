@@ -3,53 +3,115 @@ name: Tests
 on:
   workflow_dispatch:
   push:
-    # Publish the `master` branch.
     branches:
       - main
-
-    # Publish `v1.2.3` tags as releases.
     tags:
       - v*
-
   pull_request:
     branches:
       - main
 
-env:
-  TSS_TENANT: ${{ secrets.TSS_TENANT }}
-  TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
-  TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
-  TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
-  TSS_SECRET_PATH: ${{ secrets.TSS_SECRET_PATH }}
-  TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
-  TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
-  TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
-  TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
-  TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
-  TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
-  TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
-  TSS_PLATFORM_USERNAME: ${{ secrets.TSS_PLATFORM_USERNAME }}
-  TSS_PLATFORM_PASSWORD: ${{ secrets.TSS_PLATFORM_PASSWORD }}
-  TSS_PLATFORM_URL: ${{ secrets.TSS_PLATFORM_URL }}
+permissions:
+  contents: read
 
 jobs:
-  build:
-    name: Build
+  verify:
+    name: Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - '1.26.0'
+          - '1.26'
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build all packages
+        run: go build -v ./...
+
+      - name: Test all packages
+        run: go test -race -v ./...
+
+  analysis:
+    name: Static and vulnerability analysis
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4 # v4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.21'
+          go-version: '1.26'
+          check-latest: true
 
-      - name: Get dependencies
-        run: go get -v -t -d ./...
+      - name: Vet
+        run: go vet ./...
 
-      - name: Build
-        run: go build -v ./server
+      - name: Staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2026.1
+          staticcheck ./...
 
-      - name: Test
-        run: go test -v ./server
+      - name: Check reachable vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+  integration:
+    name: Live Secret Server and Platform
+    runs-on: ubuntu-latest
+    env:
+      # Each target is required independently when its primary credential is
+      # available. Fork PRs receive no secrets and cleanly skip both batteries.
+      TSS_REQUIRE_SECRET_SERVER: ${{ secrets.TSS_USERNAME != '' && '1' || '' }}
+      TSS_REQUIRE_PLATFORM: ${{ secrets.TSS_PLATFORM_USERNAME != '' && '1' || '' }}
+      TSS_TENANT: ${{ secrets.TSS_TENANT }}
+      TSS_SERVER_URL: ${{ secrets.TSS_SERVER_URL }}
+      TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
+      TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
+      TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
+      TSS_SECRET_PATH: ${{ secrets.TSS_SECRET_PATH }}
+      TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
+      TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
+      TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
+      TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
+      TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
+      TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
+      TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
+      TSS_PLATFORM_USERNAME: ${{ secrets.TSS_PLATFORM_USERNAME }}
+      TSS_PLATFORM_PASSWORD: ${{ secrets.TSS_PLATFORM_PASSWORD }}
+      TSS_PLATFORM_URL: ${{ secrets.TSS_PLATFORM_URL }}
+      TSS_PLATFORM_ALLOWED_VAULT_HOSTS: ${{ secrets.TSS_PLATFORM_ALLOWED_VAULT_HOSTS }}
+      TSS_PLATFORM_SECRET_ID: ${{ secrets.TSS_PLATFORM_SECRET_ID }}
+      TSS_PLATFORM_SECRET_PATH: ${{ secrets.TSS_PLATFORM_SECRET_PATH }}
+      TSS_PLATFORM_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_TEMPLATE_ID }}
+      TSS_PLATFORM_FOLDER_ID: ${{ secrets.TSS_PLATFORM_FOLDER_ID }}
+      TSS_PLATFORM_SITE_ID: ${{ secrets.TSS_PLATFORM_SITE_ID }}
+      TSS_PLATFORM_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_SSH_KEY_TEMPLATE_ID }}
+      TSS_PLATFORM_TEST_PASSWORD: ${{ secrets.TSS_PLATFORM_TEST_PASSWORD }}
+      TSS_PLATFORM_SEARCH_FIELD: ${{ secrets.TSS_PLATFORM_SEARCH_FIELD }}
+      TSS_PLATFORM_SEARCH_TEXT: ${{ secrets.TSS_PLATFORM_SEARCH_TEXT }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Run live battery once
+        run: go test -race -v ./server

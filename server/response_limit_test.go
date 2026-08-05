@@ -2,7 +2,6 @@ package server
 
 import (
 	"io"
-	"io/ioutil"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -26,7 +25,7 @@ func TestHandleResponseRejectsOversizedBody(t *testing.T) {
 	res := &http.Response{
 		StatusCode: http.StatusOK,
 		Status:     "200 OK",
-		Body:       ioutil.NopCloser(io.LimitReader(zeroReader{}, defaultMaxResponseBytes+10)),
+		Body:       io.NopCloser(io.LimitReader(zeroReader{}, defaultMaxResponseBytes+10)),
 	}
 
 	data, _, err := Server{}.handleResponse(res, nil)
@@ -53,7 +52,7 @@ func TestMaxResponseBytesConfigurable(t *testing.T) {
 	over := &http.Response{
 		StatusCode: http.StatusOK,
 		Status:     "200 OK",
-		Body:       ioutil.NopCloser(strings.NewReader(strings.Repeat("x", 65))),
+		Body:       io.NopCloser(strings.NewReader(strings.Repeat("x", 65))),
 	}
 	if _, _, err := s.handleResponse(over, nil); err == nil {
 		t.Error("expected an error for a body over the configured MaxResponseBytes, got nil")
@@ -62,7 +61,7 @@ func TestMaxResponseBytesConfigurable(t *testing.T) {
 	within := &http.Response{
 		StatusCode: http.StatusOK,
 		Status:     "200 OK",
-		Body:       ioutil.NopCloser(strings.NewReader(strings.Repeat("x", 64))),
+		Body:       io.NopCloser(strings.NewReader(strings.Repeat("x", 64))),
 	}
 	data, _, err := s.handleResponse(within, nil)
 	if err != nil {
@@ -85,7 +84,7 @@ func TestMaxResponseBytesAtMaxInt64ReadsTheBody(t *testing.T) {
 	res := &http.Response{
 		StatusCode: http.StatusOK,
 		Status:     "200 OK",
-		Body:       ioutil.NopCloser(strings.NewReader("payload")),
+		Body:       io.NopCloser(strings.NewReader("payload")),
 	}
 	data, _, err := s.handleResponse(res, nil)
 	if err != nil {

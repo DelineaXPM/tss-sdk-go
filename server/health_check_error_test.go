@@ -132,15 +132,17 @@ func TestHealthCheckErrorVariants(t *testing.T) {
 	ssErr := errors.New("secret server probe failed")
 	platformErr := errors.New("platform probe failed")
 
+	// When both probes fail, both causes must be matchable: a caller asking whether it
+	// hit an untrusted CA should get an answer regardless of which probe hit it.
 	for _, c := range []struct {
 		name        string
 		ssErr       error
 		platformErr error
-		wrapped     error
+		wrapped     []error
 	}{
-		{"both failed", ssErr, platformErr, platformErr},
-		{"secret server failed", ssErr, nil, ssErr},
-		{"platform failed", nil, platformErr, platformErr},
+		{"both failed", ssErr, platformErr, []error{ssErr, platformErr}},
+		{"secret server failed", ssErr, nil, []error{ssErr}},
+		{"platform failed", nil, platformErr, []error{platformErr}},
 		{"both reachable but unhealthy", nil, nil, nil},
 	} {
 		err := healthCheckError(ssURL, c.ssErr, platformURL, c.platformErr)
@@ -151,8 +153,10 @@ func TestHealthCheckErrorVariants(t *testing.T) {
 		if !strings.Contains(err.Error(), ssURL) || !strings.Contains(err.Error(), platformURL) {
 			t.Errorf("%s: error %q does not name both probed URLs", c.name, err)
 		}
-		if c.wrapped != nil && !errors.Is(err, c.wrapped) {
-			t.Errorf("%s: error does not wrap the underlying cause: %v", c.name, err)
+		for _, want := range c.wrapped {
+			if !errors.Is(err, want) {
+				t.Errorf("%s: error does not wrap %v: %v", c.name, want, err)
+			}
 		}
 	}
 }
