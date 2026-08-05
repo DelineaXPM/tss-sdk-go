@@ -2,13 +2,13 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"mime/multipart"
@@ -25,6 +25,7 @@ const (
 	defaultAPIPathURI    string = "/api/v1"
 	defaultTokenPathURI  string = "/oauth2/token"
 	defaultTLD           string = "com"
+	defaultHTTPTimeout          = 60 * time.Second
 )
 
 // Logger is an interface for logging in the SDK. It matches the standard log package interface.
@@ -70,6 +71,16 @@ func (s *stdLogger) Println(v ...interface{}) {
 // Following Go library conventions, logging is disabled by default.
 // To enable logging, set Configuration.Logger to log.Default() or a custom logger.
 var defaultLoggerInstance Logger = &DiscardLogger{}
+
+func init() {
+	// Transport.Clone performs the standard library's one-time HTTP/2 setup on its
+	// receiver. Complete that setup during single-threaded package initialization so
+	// later per-Server clones neither race with nor mutate the process-global default.
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		cloned := transport.Clone()
+		cloned.CloseIdleConnections()
+	}
+}
 
 // UserCredential holds the username and password that the API should use to
 // authenticate to the REST API
@@ -129,11 +140,28 @@ func redactSecret(secret string) string {
 type Configuration struct {
 	Credentials                                      UserCredential
 	ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
-	TLSClientConfig                                  *tls.Config
-	Logger                                           Logger
-	// Timeout, when non-zero, bounds each HTTP request made by the Server.
-	// A zero value keeps the previous behavior of no client-imposed timeout.
+	TLSClientConfig                                  *tls.Config `json:"-"`
+	Logger                                           Logger      `json:"-"`
+	// HTTPClient is an optional base client. New makes a shallow copy, preserving
+	// its transport, cookie jar and redirect policy while keeping SDK-specific
+	// timeout and redirect protections scoped to this Server.
+	HTTPClient *http.Client `json:"-"`
+	// Timeout bounds each HTTP request made by the Server. Zero selects the safe
+	// default of 60 seconds; set DisableTimeout only when a caller-supplied context
+	// provides the required bound.
 	Timeout time.Duration
+	// DisableTimeout explicitly disables both the safe default and an injected
+	// HTTPClient's timeout.
+	DisableTimeout bool
+	// AllowedVaultHosts contains exact hostnames (or host:port values) that
+	// Platform discovery may select in addition to same-origin and Delinea Cloud
+	// vaults. It is intended for on-premises Platform deployments whose vault is
+	// hosted on a different origin.
+	AllowedVaultHosts []string
+	// VaultURLValidator may authorize a discovered HTTPS vault URL that is not
+	// covered by the built-in policy. It cannot authorize plaintext HTTP, URLs
+	// containing user information, or URLs containing a query or fragment.
+	VaultURLValidator func(platformURL, vaultURL *url.URL) error `json:"-"`
 	// MaxResponseBytes, when positive, overrides the default cap
 	// (defaultMaxResponseBytes) on the size of an API response body the SDK
 	// will read into memory. Raise it only for an on-premises Secret Server
@@ -179,42 +207,94 @@ func New(config Configuration) (*Server, error) {
 		config.tokenPathURI = defaultTokenPathURI
 	}
 	config.tokenPathURI = strings.Trim(config.tokenPathURI, "/")
-	return &Server{Configuration: config, httpClient: newHTTPClient(config)}, nil
+	httpClient, err := newHTTPClient(config)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{Configuration: config, httpClient: httpClient}, nil
 }
 
-// newHTTPClient builds an *http.Client scoped to a single Server. A caller-supplied
-// TLSClientConfig is applied to a fresh transport that copies http.DefaultTransport's
-// tuning, so the process-global transport is never mutated. Mutating it would change TLS
-// verification for all other HTTPS traffic in the process (CWE-295), race with concurrent
-// use, and panic if the default transport had been replaced with a non-*http.Transport.
-// (We copy the default's fields rather than calling Clone(), because Clone() forces the
-// default transport's one-time HTTP/2 initialization, which itself writes to the global.)
-// It returns nil when no per-Server client is needed, in which case the Server falls back
-// to http.DefaultClient.
-func newHTTPClient(config Configuration) *http.Client {
-	if config.TLSClientConfig == nil && config.Timeout == 0 {
-		return nil
+// newHTTPClient makes a Server-scoped copy of the configured client. Transport.Clone
+// preserves every standard transport option, including fields added by newer Go
+// releases, while a non-standard RoundTripper is preserved unless TLSClientConfig must
+// be applied. In that case New fails closed rather than silently bypassing the wrapper
+// or ignoring the requested TLS policy.
+func newHTTPClient(config Configuration) (*http.Client, error) {
+	baseClient := http.DefaultClient
+	if config.HTTPClient != nil {
+		baseClient = config.HTTPClient
 	}
-	client := &http.Client{Timeout: config.Timeout}
+	client := *baseClient
+
+	if config.Timeout < 0 {
+		return nil, fmt.Errorf("Timeout must not be negative")
+	}
+	switch {
+	case config.DisableTimeout:
+		client.Timeout = 0
+	case config.Timeout > 0:
+		client.Timeout = config.Timeout
+	case client.Timeout == 0:
+		client.Timeout = defaultHTTPTimeout
+	}
+
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
 	if config.TLSClientConfig != nil {
-		transport := &http.Transport{}
-		if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok {
-			transport.Proxy = defaultTransport.Proxy
-			transport.DialContext = defaultTransport.DialContext
-			transport.ForceAttemptHTTP2 = defaultTransport.ForceAttemptHTTP2
-			transport.MaxIdleConns = defaultTransport.MaxIdleConns
-			transport.IdleConnTimeout = defaultTransport.IdleConnTimeout
-			transport.TLSHandshakeTimeout = defaultTransport.TLSHandshakeTimeout
-			transport.ExpectContinueTimeout = defaultTransport.ExpectContinueTimeout
+		standardTransport, ok := transport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("TLSClientConfig requires an *http.Transport, got %T", transport)
 		}
-		transport.TLSClientConfig = config.TLSClientConfig
+		clonedTransport := standardTransport.Clone()
+		clonedTransport.TLSClientConfig = config.TLSClientConfig.Clone()
+		client.Transport = clonedTransport
+	} else {
 		client.Transport = transport
 	}
-	return client
+
+	configuredRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		if sensitiveRedirectsDisabled(via[0].Context()) {
+			return http.ErrUseLastResponse
+		}
+		if !sameOrigin(via[0].URL, req.URL) {
+			return fmt.Errorf("refusing redirect from %s to a different origin %s", via[0].URL, req.URL)
+		}
+		if configuredRedirect != nil {
+			return configuredRedirect(req, via)
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		return nil
+	}
+
+	return &client, nil
 }
 
-// client returns the per-Server HTTP client, or http.DefaultClient when the Server
-// was configured with neither a TLSClientConfig nor a Timeout.
+type sensitiveRedirectContextKey struct{}
+
+func withoutRedirects(req *http.Request) *http.Request {
+	ctx := context.WithValue(req.Context(), sensitiveRedirectContextKey{}, true)
+	return req.WithContext(ctx)
+}
+
+func sensitiveRedirectsDisabled(ctx context.Context) bool {
+	disabled, _ := ctx.Value(sensitiveRedirectContextKey{}).(bool)
+	return disabled
+}
+
+func sameOrigin(first, second *url.URL) bool {
+	return strings.EqualFold(first.Scheme, second.Scheme) && strings.EqualFold(first.Host, second.Host)
+}
+
+// client returns the per-Server HTTP client. The fallback keeps manually constructed
+// zero-value Servers usable in package tests; New always installs a scoped client.
 func (s Server) client() *http.Client {
 	if s.httpClient != nil {
 		return s.httpClient
@@ -552,13 +632,13 @@ func (s *Server) getAccessToken() (string, error) {
 	}
 	baseURL := s.baseURL()
 
-	response, err := s.checkPlatformDetails(baseURL)
+	details, err := s.checkPlatformDetails(baseURL)
 	if err != nil {
 		s.log().Print("Error while checking server details:", err)
 		return "", err
 	}
 
-	if response == "" {
+	if !details.isPlatform {
 		accessToken, found := s.getCacheAccessToken(baseURL)
 		if found {
 			return accessToken, nil
@@ -573,9 +653,15 @@ func (s *Server) getAccessToken() (string, error) {
 			values["domain"] = []string{s.Credentials.Domain}
 		}
 
-		body := strings.NewReader(values.Encode())
-		requestUrl := s.urlFor("token", "")
-		data, _, err := s.handleResponse(s.client().Post(requestUrl, "application/x-www-form-urlencoded", body))
+		requestURL := s.urlFor("token", "")
+		req, err := http.NewRequest(http.MethodPost, requestURL, strings.NewReader(values.Encode()))
+		if err != nil {
+			return "", fmt.Errorf("creating token request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = withoutRedirects(req)
+		response, requestErr := s.client().Do(req)
+		data, _, err := s.handleResponseWithLimit(response, requestErr, maxAuthenticationResponseBytes)
 
 		if err != nil {
 			s.log().Print("[ERROR] grant response error:", err)
@@ -593,6 +679,9 @@ func (s *Server) getAccessToken() (string, error) {
 			s.log().Print("[ERROR] parsing grant response:", err)
 			return "", err
 		}
+		if err = validateTokenGrant(grant.AccessToken, grant.TokenType, grant.ExpiresIn); err != nil {
+			return "", fmt.Errorf("invalid token response from %s: %w", requestURL, err)
+		}
 		if err = s.setCacheAccessToken(grant.AccessToken, grant.ExpiresIn, baseURL); err != nil {
 			s.log().Print("[ERROR] caching access token:", err)
 			return "", err
@@ -600,16 +689,21 @@ func (s *Server) getAccessToken() (string, error) {
 		return grant.AccessToken, nil
 	}
 
-	return response, nil
+	return details.accessToken, nil
 }
 
-func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
+type platformDetails struct {
+	isPlatform  bool
+	accessToken string
+}
+
+func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 	platformHelthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "health")
 	ssHealthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "api/v1/healthcheck")
 
 	isHealthy, ssErr := s.checkJSONResponse(ssHealthCheckUrl)
 	if isHealthy {
-		return "", nil
+		return platformDetails{}, nil
 	}
 	if ssErr != nil {
 		s.log().Println("[ERROR] Secret Server health check:", ssErr)
@@ -620,7 +714,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 		if platformErr != nil {
 			s.log().Println("[ERROR] Platform health check:", platformErr)
 		}
-		return "", healthCheckError(ssHealthCheckUrl, ssErr, platformHelthCheckUrl, platformErr)
+		return platformDetails{}, healthCheckError(ssHealthCheckUrl, ssErr, platformHelthCheckUrl, platformErr)
 	}
 
 	accessToken, found := s.getCacheAccessToken(baseURL)
@@ -634,38 +728,44 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 		req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
 		if err != nil {
 			s.log().Print("Error creating HTTP request:", err)
-			return "", err
+			return platformDetails{}, err
 		}
 
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = withoutRedirects(req)
 
-		data, _, err := s.handleResponse(s.client().Do(req))
+		response, requestErr := s.client().Do(req)
+		data, _, err := s.handleResponseWithLimit(response, requestErr, maxAuthenticationResponseBytes)
 		if err != nil {
 			s.log().Print("[ERROR] get token response error:", err)
-			return "", err
+			return platformDetails{}, err
 		}
 
 		var tokenjsonResponse OAuthTokens
 		if err = json.Unmarshal(data, &tokenjsonResponse); err != nil {
 			s.log().Print("[ERROR] parsing get token response:", err)
-			return "", err
+			return platformDetails{}, err
+		}
+		if err = validateTokenGrant(tokenjsonResponse.AccessToken, tokenjsonResponse.TokenType, tokenjsonResponse.ExpiresIn); err != nil {
+			return platformDetails{}, fmt.Errorf("invalid Platform token response: %w", err)
 		}
 		accessToken = tokenjsonResponse.AccessToken
 
 		if err = s.setCacheAccessToken(tokenjsonResponse.AccessToken, tokenjsonResponse.ExpiresIn, baseURL); err != nil {
 			s.log().Print("[ERROR] caching access token:", err)
-			return "", err
+			return platformDetails{}, err
 		}
 	}
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
 	if err != nil {
 		s.log().Print("Error creating HTTP request:", err)
-		return "", err
+		return platformDetails{}, err
 	}
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 
-	data, vaultsResponse, err := s.handleResponse(s.client().Do(req))
+	response, requestErr := s.client().Do(req)
+	data, vaultsResponse, err := s.handleResponseWithLimit(response, requestErr, maxMetadataResponseBytes)
 	if err != nil {
 		// This is the first use of the cached Platform token. If the Platform refuses
 		// it, evict it: otherwise a revoked or rotated token is served from cache for
@@ -677,13 +777,13 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 			s.log().Printf("[ERROR] Platform rejected the cached token; cleared it so the next call re-authenticates.")
 		}
 		s.log().Print("[ERROR] get vaults response error:", err)
-		return "", err
+		return platformDetails{}, err
 	}
 
 	var vaultJsonResponse VaultsResponseModel
 	if err = json.Unmarshal(data, &vaultJsonResponse); err != nil {
 		s.log().Print("[ERROR] parsing vaults response:", err)
-		return "", err
+		return platformDetails{}, err
 	}
 
 	var vaultURL string
@@ -694,11 +794,93 @@ func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
 		}
 	}
 	if vaultURL == "" {
-		return "", fmt.Errorf("no configured vault found")
+		return platformDetails{}, fmt.Errorf("no configured vault found")
 	}
-	s.ServerURL = vaultURL
+	validatedVaultURL, err := s.validateDiscoveredVaultURL(baseURL, vaultURL)
+	if err != nil {
+		return platformDetails{}, err
+	}
+	s.ServerURL = validatedVaultURL.String()
 
-	return accessToken, nil
+	return platformDetails{isPlatform: true, accessToken: accessToken}, nil
+}
+
+func validateTokenGrant(accessToken, tokenType string, expiresIn int) error {
+	if accessToken == "" || accessToken != strings.TrimSpace(accessToken) {
+		return fmt.Errorf("access_token is missing or contains surrounding whitespace")
+	}
+	if tokenType != "" && !strings.EqualFold(tokenType, "Bearer") {
+		return fmt.Errorf("unsupported token_type %q", tokenType)
+	}
+	if expiresIn <= 0 {
+		return fmt.Errorf("expires_in must be greater than zero")
+	}
+	return nil
+}
+
+var delineaCloudVaultDomains = []string{
+	"devsecretservercloud.com",
+	"secretservercloud.com",
+	"secretservercloud.eu",
+	"secretservercloud.com.au",
+	"secretservercloud.com.sg",
+	"secretservercloud.ca",
+	"secretservercloud.co.uk",
+	"secretservercloud.ae",
+}
+
+func (s *Server) validateDiscoveredVaultURL(platformRawURL, vaultRawURL string) (*url.URL, error) {
+	platformURL, err := url.Parse(platformRawURL)
+	if err != nil || platformURL.Scheme == "" || platformURL.Host == "" {
+		return nil, fmt.Errorf("configured Platform URL is invalid")
+	}
+	vaultURL, err := url.Parse(vaultRawURL)
+	if err != nil || vaultURL.Scheme == "" || vaultURL.Host == "" {
+		return nil, fmt.Errorf("Platform returned an invalid vault URL")
+	}
+	if !strings.EqualFold(vaultURL.Scheme, "https") {
+		return nil, fmt.Errorf("Platform returned a vault URL that does not use HTTPS")
+	}
+	if vaultURL.User != nil {
+		return nil, fmt.Errorf("Platform returned a vault URL containing user information")
+	}
+	if vaultURL.RawQuery != "" || vaultURL.Fragment != "" {
+		return nil, fmt.Errorf("Platform returned a vault URL containing a query or fragment")
+	}
+
+	if sameOrigin(platformURL, vaultURL) || isDelineaCloudVaultHost(vaultURL.Hostname()) || s.isAllowedVaultHost(vaultURL) {
+		return vaultURL, nil
+	}
+	if s.VaultURLValidator != nil {
+		if err := s.VaultURLValidator(platformURL, vaultURL); err == nil {
+			return vaultURL, nil
+		} else {
+			return nil, fmt.Errorf("Platform vault URL was rejected by VaultURLValidator: %w", err)
+		}
+	}
+	return nil, fmt.Errorf("Platform returned untrusted vault host %q; add it to AllowedVaultHosts if this on-premises deployment is expected", vaultURL.Host)
+}
+
+func isDelineaCloudVaultHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, domain := range delineaCloudVaultDomains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) isAllowedVaultHost(vaultURL *url.URL) bool {
+	host := strings.ToLower(strings.TrimSuffix(vaultURL.Host, "."))
+	hostname := strings.ToLower(strings.TrimSuffix(vaultURL.Hostname(), "."))
+	for _, configured := range s.AllowedVaultHosts {
+		allowed := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(configured), "."))
+		if allowed != "" && (allowed == host || allowed == hostname) {
+			return true
+		}
+	}
+	return false
 }
 
 // healthCheckError reports why neither health check identified a Secret Server or a
@@ -725,23 +907,25 @@ func healthCheckError(ssURL string, ssErr error, platformURL string, platformErr
 const maxHealthResponseBytes = 1 << 20
 
 func (s *Server) checkJSONResponse(url string) (bool, error) {
-	response, err := s.client().Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return false, fmt.Errorf("creating health probe for %s: %w", url, err)
+	}
+	response, err := s.client().Do(req)
 	if err != nil {
 		return false, fmt.Errorf("probing %s: %w", url, err)
 	}
-	defer response.Body.Close()
-
-	body, err := ioutil.ReadAll(io.LimitReader(response.Body, maxHealthResponseBytes+1))
+	body, _, err := s.handleResponseWithLimit(response, nil, maxHealthResponseBytes)
 	if err != nil {
-		return false, fmt.Errorf("reading response from %s: %w", url, err)
-	}
-	if len(body) > maxHealthResponseBytes {
-		return false, fmt.Errorf("health response from %s exceeded %d bytes", url, maxHealthResponseBytes)
+		return false, fmt.Errorf("probing %s: %w", url, err)
 	}
 
 	var jsonResponse Response
 	if err := json.Unmarshal(body, &jsonResponse); err != nil {
-		return strings.Contains(string(body), "Healthy"), nil
+		if strings.EqualFold(strings.TrimSpace(string(body)), "Healthy") {
+			return true, nil
+		}
+		return false, fmt.Errorf("health response from %s was neither valid JSON nor the legacy Healthy value", url)
 	}
 	return jsonResponse.Healthy, nil
 }

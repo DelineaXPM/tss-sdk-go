@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -75,6 +76,29 @@ func TestHandleResponseKeepsShortErrorBody(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "403 Forbidden") {
 		t.Errorf("error = %q, want it to carry the HTTP status", err)
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error type = %T, want *HTTPError", err)
+	}
+	if httpErr.StatusCode != http.StatusForbidden {
+		t.Errorf("HTTPError.StatusCode = %d, want %d", httpErr.StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestHandleResponseSanitizesErrorControlCharacters(t *testing.T) {
+	res := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Status:     "502 Bad Gateway",
+		Body:       ioutil.NopCloser(strings.NewReader("first\nforged-log-line")),
+		Header:     make(http.Header),
+	}
+	_, _, err := Server{}.handleResponse(res, nil)
+	if err == nil {
+		t.Fatal("expected an HTTP error")
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("error retained a log-injecting newline: %q", err)
 	}
 }
 

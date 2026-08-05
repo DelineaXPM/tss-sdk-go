@@ -36,8 +36,9 @@ func platformServer(t *testing.T, vaults string) (*httptest.Server, *Server) {
 	t.Cleanup(ts.Close)
 
 	s, err := New(Configuration{
-		ServerURL:   ts.URL,
-		Credentials: UserCredential{Username: "client-id", Password: "client-secret"},
+		ServerURL:         ts.URL,
+		Credentials:       UserCredential{Username: "client-id", Password: "client-secret"},
+		AllowedVaultHosts: []string{"vault.example.com"},
 	})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
@@ -50,12 +51,15 @@ func platformServer(t *testing.T, vaults string) (*httptest.Server, *Server) {
 func TestCheckPlatformDetailsSelectsDefaultActiveVault(t *testing.T) {
 	ts, s := platformServer(t, platformVaults)
 
-	token, err := s.checkPlatformDetails(ts.URL)
+	details, err := s.checkPlatformDetails(ts.URL)
 	if err != nil {
 		t.Fatalf("checkPlatformDetails returned error: %v", err)
 	}
-	if token != "platform-token" {
-		t.Errorf("token = %q, want %q", token, "platform-token")
+	if !details.isPlatform {
+		t.Error("checkPlatformDetails did not identify the Platform")
+	}
+	if details.accessToken != "platform-token" {
+		t.Errorf("token = %q, want %q", details.accessToken, "platform-token")
 	}
 	if s.ServerURL != "https://vault.example.com" {
 		t.Errorf("ServerURL = %q, want the default and active vault %q", s.ServerURL, "https://vault.example.com")

@@ -4,7 +4,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -48,8 +50,11 @@ func TestNewDoesNotMutateDefaultTransport(t *testing.T) {
 	if transport == http.DefaultTransport {
 		t.Error("Server transport is the shared http.DefaultTransport; expected a distinct clone")
 	}
-	if transport.TLSClientConfig != tlsConfig {
-		t.Errorf("Server transport TLSClientConfig = %p, want %p", transport.TLSClientConfig, tlsConfig)
+	if transport.TLSClientConfig == tlsConfig {
+		t.Error("Server retained the caller's mutable TLSClientConfig pointer; expected a clone")
+	}
+	if !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Error("Server TLSClientConfig clone did not preserve InsecureSkipVerify")
 	}
 }
 
@@ -77,25 +82,18 @@ func TestServerClientUsesSuppliedTLSConfig(t *testing.T) {
 	}
 }
 
-// TestNewNoPanicWhenDefaultTransportReplaced covers the unchecked type-assertion vector:
-// New must not panic when http.DefaultTransport is not an *http.Transport.
-func TestNewNoPanicWhenDefaultTransportReplaced(t *testing.T) {
+// TestNewFailsClosedWhenTLSCannotBeApplied covers the unchecked type-assertion vector:
+// New must not panic or silently bypass a custom transport when it cannot apply TLS.
+func TestNewFailsClosedWhenTLSCannotBeApplied(t *testing.T) {
 	original := http.DefaultTransport
 	http.DefaultTransport = stubRoundTripper{}
 	defer func() { http.DefaultTransport = original }()
 
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
-	s, err := New(Configuration{ServerURL: "https://example.com", TLSClientConfig: tlsConfig})
-	if err != nil {
-		t.Fatalf("New returned error: %v", err)
-	}
-
-	transport, ok := s.client().Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("Server client transport is not an *http.Transport")
-	}
-	if transport.TLSClientConfig != tlsConfig {
-		t.Errorf("Server transport TLSClientConfig = %p, want %p", transport.TLSClientConfig, tlsConfig)
+	if _, err := New(Configuration{ServerURL: "https://example.com", TLSClientConfig: tlsConfig}); err == nil {
+		t.Fatal("New silently accepted TLSClientConfig with a non-cloneable transport")
+	} else if !strings.Contains(err.Error(), "*http.Transport") {
+		t.Errorf("New error = %q, want it to explain the transport requirement", err)
 	}
 }
 
@@ -158,18 +156,53 @@ func TestPerServerTransportInheritsDefaultTuning(t *testing.T) {
 	}
 }
 
-// TestNewNilTLSConfigKeepsDefaultBehavior verifies backward compatibility: with no
-// TLSClientConfig and no Timeout, the Server uses http.DefaultClient exactly as before.
-func TestNewNilTLSConfigKeepsDefaultBehavior(t *testing.T) {
+// TestNewDefaultClientIsScopedAndBounded verifies the zero-value network configuration
+// receives the SDK's redirect policy and safe default request timeout.
+func TestNewDefaultClientIsScopedAndBounded(t *testing.T) {
 	s, err := New(Configuration{ServerURL: "https://example.com"})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
-	if s.httpClient != nil {
-		t.Errorf("expected nil per-Server client for default configuration, got %p", s.httpClient)
+	if s.httpClient == nil {
+		t.Fatal("expected a per-Server client for default configuration")
 	}
-	if s.client() != http.DefaultClient {
-		t.Error("expected client() to fall back to http.DefaultClient")
+	if s.client() == http.DefaultClient {
+		t.Error("Server uses the process-global client; redirect and timeout policy are not scoped")
+	}
+	if got := s.client().Timeout; got != defaultHTTPTimeout {
+		t.Errorf("default client timeout = %v, want %v", got, defaultHTTPTimeout)
+	}
+}
+
+func TestDisableTimeoutIsExplicit(t *testing.T) {
+	s, err := New(Configuration{ServerURL: "https://example.com", DisableTimeout: true})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if got := s.client().Timeout; got != 0 {
+		t.Errorf("client timeout = %v, want no client timeout", got)
+	}
+}
+
+func TestInjectedClientBehaviorIsPreserved(t *testing.T) {
+	transport := stubRoundTripper{}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar.New returned error: %v", err)
+	}
+	base := &http.Client{Transport: transport, Jar: jar, Timeout: 13 * time.Second}
+	s, err := New(Configuration{ServerURL: "https://example.com", HTTPClient: base})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if s.client() == base {
+		t.Error("New reused the caller's client pointer")
+	}
+	if s.client().Transport != transport || s.client().Jar != jar {
+		t.Error("New did not preserve the injected transport and cookie jar")
+	}
+	if s.client().Timeout != base.Timeout {
+		t.Errorf("timeout = %v, want injected %v", s.client().Timeout, base.Timeout)
 	}
 }
 

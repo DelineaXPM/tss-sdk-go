@@ -70,18 +70,29 @@ func targets() []target {
 			envPrefix:  "TSS_PLATFORM_",
 			requireVar: "TSS_REQUIRE_PLATFORM",
 			configFile: "../test_config_platform.json",
-			envVars:    []string{"TSS_PLATFORM_USERNAME", "TSS_PLATFORM_PASSWORD", "TSS_PLATFORM_URL"},
+			envVars:    []string{"TSS_PLATFORM_USERNAME", "TSS_PLATFORM_PASSWORD", "TSS_PLATFORM_URL", "TSS_PLATFORM_ALLOWED_VAULT_HOSTS"},
 			envConfig: func() Configuration {
 				return Configuration{
 					Credentials: UserCredential{
 						Username: os.Getenv("TSS_PLATFORM_USERNAME"),
 						Password: os.Getenv("TSS_PLATFORM_PASSWORD"),
 					},
-					ServerURL: os.Getenv("TSS_PLATFORM_URL"),
+					ServerURL:         os.Getenv("TSS_PLATFORM_URL"),
+					AllowedVaultHosts: configuredVaultHosts(os.Getenv("TSS_PLATFORM_ALLOWED_VAULT_HOSTS")),
 				}
 			},
 		},
 	}
+}
+
+func configuredVaultHosts(value string) []string {
+	var hosts []string
+	for _, host := range strings.Split(value, ",") {
+		if host = strings.TrimSpace(host); host != "" {
+			hosts = append(hosts, host)
+		}
+	}
+	return hosts
 }
 
 func (tgt target) configured() bool {
