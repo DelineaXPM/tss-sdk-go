@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 )
 
@@ -25,9 +27,14 @@ type SecretTemplateField struct {
 
 // SecretTemplate gets the secret template with id from the Secret Server of the given tenant
 func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
+	return s.SecretTemplateContext(context.Background(), id)
+}
+
+// SecretTemplateContext is SecretTemplate with caller-controlled cancellation and deadlines.
+func (s Server) SecretTemplateContext(ctx context.Context, id int) (*SecretTemplate, error) {
 	secretTemplate := new(SecretTemplate)
 
-	if data, err := s.accessResource("GET", templateResource, strconv.Itoa(id), nil); err == nil {
+	if data, err := s.accessResourceContext(ctx, http.MethodGet, templateResource, strconv.Itoa(id), nil); err == nil {
 		if err = json.Unmarshal(data, secretTemplate); err != nil {
 			s.log().Printf("[ERROR] parsing response from /%s/%d: %v (%d-byte body not logged)", templateResource, id, err, len(data))
 			return nil, err
@@ -43,6 +50,11 @@ func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
 // template. The password adheres to the password requirements associated with the field. NOTE: this should only be
 // used with fields whose IsPassword property is true.
 func (s Server) GeneratePassword(slug string, template *SecretTemplate) (string, error) {
+	return s.GeneratePasswordContext(context.Background(), slug, template)
+}
+
+// GeneratePasswordContext is GeneratePassword with caller-controlled cancellation and deadlines.
+func (s Server) GeneratePasswordContext(ctx context.Context, slug string, template *SecretTemplate) (string, error) {
 	fieldId, found := template.FieldSlugToId(slug)
 
 	if !found {
@@ -52,7 +64,7 @@ func (s Server) GeneratePassword(slug string, template *SecretTemplate) (string,
 	}
 	path := fmt.Sprintf("generate-password/%d", fieldId)
 
-	data, err := s.accessResource("POST", templateResource, path, nil)
+	data, err := s.accessResourceContext(ctx, http.MethodPost, templateResource, path, nil)
 	if err != nil {
 		return "", err
 	}

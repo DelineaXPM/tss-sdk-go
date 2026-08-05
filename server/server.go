@@ -9,25 +9,31 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	cloudBaseURLTemplate string = "https://%s.secretservercloud.%s/"
-	defaultAPIPathURI    string = "/api/v1"
-	defaultTokenPathURI  string = "/oauth2/token"
-	defaultTLD           string = "com"
-	defaultHTTPTimeout          = 60 * time.Second
+	cloudBaseURLTemplate  string = "https://%s.secretservercloud.%s/"
+	defaultAPIPathURI     string = "/api/v1"
+	defaultTokenPathURI   string = "/oauth2/token"
+	defaultTLD            string = "com"
+	defaultHTTPTimeout           = 60 * time.Second
+	defaultMaxRetries            = 2
+	defaultRetryBaseDelay        = 100 * time.Millisecond
+	maximumRetryDelay            = 5 * time.Second
 )
 
 // Logger is an interface for logging in the SDK. It matches the standard log package interface.
@@ -158,6 +164,12 @@ type Configuration struct {
 	// DisableTimeout explicitly disables both the safe default and an injected
 	// HTTPClient's timeout.
 	DisableTimeout bool
+	// MaxRetries is the number of retries after the initial request for safe reads.
+	// Zero selects the default of two. DisableRetries explicitly selects none.
+	MaxRetries     int
+	DisableRetries bool
+	// RetryBaseDelay is the initial backoff before jitter. Zero selects 100ms.
+	RetryBaseDelay time.Duration
 	// AllowedVaultHosts contains exact hostnames (or host:port values) that
 	// Platform discovery may select in addition to same-origin and Delinea Cloud
 	// vaults. It is intended for on-premises Platform deployments whose vault is
@@ -235,6 +247,12 @@ func New(config Configuration) (*Server, error) {
 	if config.TLD == "" {
 		config.TLD = defaultTLD
 	}
+	if config.MaxRetries < 0 {
+		return nil, fmt.Errorf("max retries must not be negative")
+	}
+	if config.RetryBaseDelay < 0 {
+		return nil, fmt.Errorf("retry base delay must not be negative")
+	}
 	if config.apiPathURI == "" {
 		config.apiPathURI = defaultAPIPathURI
 	}
@@ -263,7 +281,7 @@ func newHTTPClient(config Configuration) (*http.Client, error) {
 	client := *baseClient
 
 	if config.Timeout < 0 {
-		return nil, fmt.Errorf("Timeout must not be negative")
+		return nil, fmt.Errorf("timeout must not be negative")
 	}
 	switch {
 	case config.DisableTimeout:
@@ -338,6 +356,110 @@ func (s Server) client() *http.Client {
 	return http.DefaultClient
 }
 
+// do sends a request and retries only methods that are safe to repeat. Credential
+// grants, creates, updates, deletes and uploads therefore remain single-attempt even
+// when a transport fails after the server may have acted on the request.
+func (s Server) do(req *http.Request) (*http.Response, error) {
+	retries := s.retryCount(req.Method)
+	current := req
+	for attempt := 0; ; attempt++ {
+		response, err := s.client().Do(current)
+		if attempt >= retries || !shouldRetryResponse(current.Context(), response, err) {
+			return response, err
+		}
+		if response != nil && response.Body != nil {
+			response.Body.Close()
+		}
+
+		delay := s.retryDelay(attempt, response)
+		timer := time.NewTimer(delay)
+		select {
+		case <-current.Context().Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, current.Context().Err()
+		case <-timer.C:
+		}
+		current = req.Clone(req.Context())
+	}
+}
+
+func (s Server) retryCount(method string) int {
+	if s.DisableRetries || (method != http.MethodGet && method != http.MethodHead) {
+		return 0
+	}
+	if s.MaxRetries > 0 {
+		return s.MaxRetries
+	}
+	return defaultMaxRetries
+}
+
+func shouldRetryResponse(ctx context.Context, response *http.Response, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if err != nil {
+		var networkError net.Error
+		return errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) ||
+			errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+	}
+	return response != nil && (response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500)
+}
+
+func (s Server) retryDelay(attempt int, response *http.Response) time.Duration {
+	if response != nil {
+		if delay, ok := parseRetryAfter(response.Header.Get("Retry-After")); ok {
+			return delay
+		}
+	}
+	base := s.RetryBaseDelay
+	if base == 0 {
+		base = defaultRetryBaseDelay
+	}
+	for i := 0; i < attempt && base < maximumRetryDelay; i++ {
+		base *= 2
+	}
+	if base > maximumRetryDelay {
+		base = maximumRetryDelay
+	}
+	var randomByte [1]byte
+	if _, err := rand.Read(randomByte[:]); err != nil {
+		randomByte[0] = 128
+	}
+	// Apply 50%-150% jitter, then retain the hard upper bound.
+	delay := base/2 + time.Duration(uint64(base)*uint64(randomByte[0])/255)
+	if delay > maximumRetryDelay {
+		return maximumRetryDelay
+	}
+	return delay
+}
+
+func parseRetryAfter(value string) (time.Duration, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		delay := time.Duration(seconds) * time.Second
+		if delay > maximumRetryDelay {
+			delay = maximumRetryDelay
+		}
+		return delay, true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	delay := time.Until(when)
+	if delay < 0 {
+		delay = 0
+	}
+	if delay > maximumRetryDelay {
+		delay = maximumRetryDelay
+	}
+	return delay, true
+}
+
 // log returns the logger to use for this Server. If no Logger is configured,
 // it returns the default logger that uses the standard log package.
 func (s *Server) log() Logger {
@@ -408,6 +530,10 @@ func (s Server) urlForSearch(resource, searchText, fieldName string) string {
 // accessResource uses the accessToken to access the API resource.
 // It assumes an appropriate combination of method, resource, path and input.
 func (s Server) accessResource(method, resource, path string, input interface{}) ([]byte, error) {
+	return s.accessResourceContext(context.Background(), method, resource, path, input)
+}
+
+func (s Server) accessResourceContext(ctx context.Context, method, resource, path string, input interface{}) ([]byte, error) {
 	switch resource {
 	case "secrets":
 	case "secret-templates":
@@ -429,14 +555,14 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 		}
 	}
 
-	accessToken, err := s.getAccessTokenDetails()
+	accessToken, err := s.getAccessTokenDetailsContext(ctx)
 
 	if err != nil {
 		s.log().Print("[ERROR] error getting accessToken:", err)
 		return nil, err
 	}
 
-	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
+	req, err := http.NewRequestWithContext(ctx, method, s.urlFor(resource, path), body)
 
 	if err != nil {
 		s.log().Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
@@ -452,7 +578,7 @@ func (s Server) accessResource(method, resource, path string, input interface{})
 
 	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
-	data, statusCode, err := s.handleResponse(s.client().Do(req))
+	data, statusCode, err := s.handleResponse(s.do(req))
 
 	s.evictOnAuthFailure(statusCode, accessToken)
 
@@ -476,6 +602,10 @@ func (s Server) evictOnAuthFailure(res *http.Response, token accessTokenDetails)
 // It assumes an appropriate combination of resource, search text.
 // field is optional
 func (s Server) searchResources(resource, searchText, field string) ([]byte, error) {
+	return s.searchResourcesContext(context.Background(), resource, searchText, field)
+}
+
+func (s Server) searchResourcesContext(ctx context.Context, resource, searchText, field string) ([]byte, error) {
 	switch resource {
 	case "secrets":
 	default:
@@ -488,14 +618,14 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 	method := "GET"
 	body := bytes.NewBuffer([]byte{})
 
-	accessToken, err := s.getAccessTokenDetails()
+	accessToken, err := s.getAccessTokenDetailsContext(ctx)
 
 	if err != nil {
 		s.log().Print("[ERROR] error getting accessToken:", err)
 		return nil, err
 	}
 
-	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
+	req, err := http.NewRequestWithContext(ctx, method, s.urlForSearch(resource, searchText, field), body)
 
 	if err != nil {
 		s.log().Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
@@ -506,7 +636,7 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 
 	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
 
-	data, statusCode, err := s.handleResponse(s.client().Do(req))
+	data, statusCode, err := s.handleResponse(s.do(req))
 
 	s.evictOnAuthFailure(statusCode, accessToken)
 
@@ -516,12 +646,16 @@ func (s Server) searchResources(resource, searchText, field string) ([]byte, err
 // uploadFile uploads the file described in the given fileField to the
 // secret at the given secretId as a multipart/form-data request.
 func (s Server) uploadFile(secretId int, fileField SecretField) error {
+	return s.uploadFileContext(context.Background(), secretId, fileField)
+}
+
+func (s Server) uploadFileContext(ctx context.Context, secretId int, fileField SecretField) error {
 	s.log().Printf("[DEBUG] uploading a file to the '%s' field with filename '%s'", fileField.Slug, fileField.Filename)
 	body := bytes.NewBuffer([]byte{})
 	path := fmt.Sprintf("%d/fields/%s", secretId, url.PathEscape(fileField.Slug))
 
 	// Fetch the access token
-	accessToken, err := s.getAccessTokenDetails()
+	accessToken, err := s.getAccessTokenDetailsContext(ctx)
 	if err != nil {
 		s.log().Print("[ERROR] error getting accessToken:", err)
 		return err
@@ -551,14 +685,14 @@ func (s Server) uploadFile(secretId int, fileField SecretField) error {
 	}
 
 	// Make the request
-	req, err := http.NewRequest("PUT", s.urlFor(resource, path), body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.urlFor(resource, path), body)
 	if err != nil {
 		return err
 	}
 	req.Header.Add("Authorization", "Bearer "+accessToken.value)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	s.log().Printf("[DEBUG] uploading file with PUT %s", req.URL.String())
-	_, statusCode, err := s.handleResponse(s.client().Do(req))
+	_, statusCode, err := s.handleResponse(s.do(req))
 
 	s.evictOnAuthFailure(statusCode, accessToken)
 
@@ -650,7 +784,7 @@ func evictOldestTokenLocked() {
 // grant runs without the global cache lock, so unrelated servers and credentials can
 // authenticate concurrently. Waiters receive the exact generation stored by the
 // leader, which later makes auth-failure eviction compare-and-delete safe.
-func (s *Server) cachedOrGrantToken(baseURL string, grant func() (tokenGrant, error)) (accessTokenDetails, error) {
+func (s *Server) cachedOrGrantToken(ctx context.Context, baseURL string, grant func(context.Context) (tokenGrant, error)) (accessTokenDetails, error) {
 	key := s.cacheKey(baseURL)
 	now := time.Now().Unix()
 	tokenCacheMu.Lock()
@@ -661,14 +795,18 @@ func (s *Server) cachedOrGrantToken(baseURL string, grant func() (tokenGrant, er
 	delete(tokenCache, key)
 	if flight, ok := tokenFlights[key]; ok {
 		tokenCacheMu.Unlock()
-		<-flight.done
-		return flight.token, flight.err
+		select {
+		case <-flight.done:
+			return flight.token, flight.err
+		case <-ctx.Done():
+			return accessTokenDetails{}, ctx.Err()
+		}
 	}
 	flight := &tokenFlight{done: make(chan struct{})}
 	tokenFlights[key] = flight
 	tokenCacheMu.Unlock()
 
-	granted, err := grant()
+	granted, err := grant(ctx)
 	if err == nil {
 		flight.token, err = s.storeCacheAccessToken(granted.accessToken, granted.expiresIn, baseURL)
 	}
@@ -745,24 +883,24 @@ func passwordDigest(password string) string {
 // getAccessToken gets an OAuth2 Access Grant and returns the token
 // endpoint and get an accessGrant.
 func (s *Server) getAccessToken() (string, error) {
-	token, err := s.getAccessTokenDetails()
+	token, err := s.getAccessTokenDetailsContext(context.Background())
 	return token.value, err
 }
 
-func (s *Server) getAccessTokenDetails() (accessTokenDetails, error) {
+func (s *Server) getAccessTokenDetailsContext(ctx context.Context) (accessTokenDetails, error) {
 	if s.Credentials.Token != "" {
 		return accessTokenDetails{value: s.Credentials.Token, source: tokenSourceSupplied}, nil
 	}
 	baseURL := s.baseURL()
 
-	details, err := s.checkPlatformDetails(baseURL)
+	details, err := s.checkPlatformDetailsContext(ctx, baseURL)
 	if err != nil {
 		s.log().Print("Error while checking server details:", err)
 		return accessTokenDetails{}, err
 	}
 
 	if !details.isPlatform {
-		return s.cachedOrGrantToken(baseURL, func() (tokenGrant, error) {
+		return s.cachedOrGrantToken(ctx, baseURL, func(ctx context.Context) (tokenGrant, error) {
 			values := url.Values{
 				"username":   {s.Credentials.Username},
 				"password":   {s.Credentials.Password},
@@ -773,13 +911,13 @@ func (s *Server) getAccessTokenDetails() (accessTokenDetails, error) {
 			}
 
 			requestURL := s.urlFor("token", "")
-			req, err := http.NewRequest(http.MethodPost, requestURL, strings.NewReader(values.Encode()))
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, strings.NewReader(values.Encode()))
 			if err != nil {
 				return tokenGrant{}, fmt.Errorf("creating token request: %w", err)
 			}
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			req = withoutRedirects(req)
-			response, requestErr := s.client().Do(req)
+			response, requestErr := s.do(req)
 			data, _, err := s.handleResponseWithLimit(response, requestErr, maxAuthenticationResponseBytes)
 
 			if err != nil {
@@ -814,10 +952,14 @@ type platformDetails struct {
 }
 
 func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
+	return s.checkPlatformDetailsContext(context.Background(), baseURL)
+}
+
+func (s *Server) checkPlatformDetailsContext(ctx context.Context, baseURL string) (platformDetails, error) {
 	platformHelthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "health")
 	ssHealthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "api/v1/healthcheck")
 
-	isHealthy, ssErr := s.checkJSONResponse(ssHealthCheckUrl)
+	isHealthy, ssErr := s.checkJSONResponseContext(ctx, ssHealthCheckUrl)
 	if isHealthy {
 		return platformDetails{}, nil
 	}
@@ -825,7 +967,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 		s.log().Println("[ERROR] Secret Server health check:", ssErr)
 	}
 
-	isHealthy, platformErr := s.checkJSONResponse(platformHelthCheckUrl)
+	isHealthy, platformErr := s.checkJSONResponseContext(ctx, platformHelthCheckUrl)
 	if !isHealthy {
 		if platformErr != nil {
 			s.log().Println("[ERROR] Platform health check:", platformErr)
@@ -833,14 +975,14 @@ func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 		return platformDetails{}, healthCheckError(ssHealthCheckUrl, ssErr, platformHelthCheckUrl, platformErr)
 	}
 
-	accessToken, err := s.cachedOrGrantToken(baseURL, func() (tokenGrant, error) {
+	accessToken, err := s.cachedOrGrantToken(ctx, baseURL, func(ctx context.Context) (tokenGrant, error) {
 		requestData := url.Values{}
 		requestData.Set("grant_type", "client_credentials")
 		requestData.Set("client_id", s.Credentials.Username)
 		requestData.Set("client_secret", s.Credentials.Password)
 		requestData.Set("scope", "xpmheadless")
 
-		req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
 		if err != nil {
 			s.log().Print("Error creating HTTP request:", err)
 			return tokenGrant{}, err
@@ -849,7 +991,7 @@ func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req = withoutRedirects(req)
 
-		response, requestErr := s.client().Do(req)
+		response, requestErr := s.do(req)
 		data, _, err := s.handleResponseWithLimit(response, requestErr, maxAuthenticationResponseBytes)
 		if err != nil {
 			s.log().Print("[ERROR] get token response error:", err)
@@ -870,14 +1012,14 @@ func (s *Server) checkPlatformDetails(baseURL string) (platformDetails, error) {
 		return platformDetails{}, err
 	}
 
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), nil)
 	if err != nil {
 		s.log().Print("Error creating HTTP request:", err)
 		return platformDetails{}, err
 	}
 	req.Header.Add("Authorization", "Bearer "+accessToken.value)
 
-	response, requestErr := s.client().Do(req)
+	response, requestErr := s.do(req)
 	data, vaultsResponse, err := s.handleResponseWithLimit(response, requestErr, maxMetadataResponseBytes)
 	if err != nil {
 		// This is the first use of the cached Platform token. If the Platform refuses
@@ -946,20 +1088,20 @@ var delineaCloudVaultDomains = []string{
 func (s *Server) validateDiscoveredVaultURL(platformRawURL, vaultRawURL string) (*url.URL, error) {
 	platformURL, err := url.Parse(platformRawURL)
 	if err != nil || platformURL.Scheme == "" || platformURL.Host == "" {
-		return nil, fmt.Errorf("configured Platform URL is invalid")
+		return nil, fmt.Errorf("configured platform URL is invalid")
 	}
 	vaultURL, err := url.Parse(vaultRawURL)
 	if err != nil || vaultURL.Scheme == "" || vaultURL.Host == "" {
-		return nil, fmt.Errorf("Platform returned an invalid vault URL")
+		return nil, fmt.Errorf("platform returned an invalid vault URL")
 	}
 	if !strings.EqualFold(vaultURL.Scheme, "https") {
-		return nil, fmt.Errorf("Platform returned a vault URL that does not use HTTPS")
+		return nil, fmt.Errorf("platform returned a vault URL that does not use HTTPS")
 	}
 	if vaultURL.User != nil {
-		return nil, fmt.Errorf("Platform returned a vault URL containing user information")
+		return nil, fmt.Errorf("platform returned a vault URL containing user information")
 	}
 	if vaultURL.RawQuery != "" || vaultURL.Fragment != "" {
-		return nil, fmt.Errorf("Platform returned a vault URL containing a query or fragment")
+		return nil, fmt.Errorf("platform returned a vault URL containing a query or fragment")
 	}
 
 	if sameOrigin(platformURL, vaultURL) || isDelineaCloudVaultHost(vaultURL.Hostname()) || s.isAllowedVaultHost(vaultURL) {
@@ -969,10 +1111,10 @@ func (s *Server) validateDiscoveredVaultURL(platformRawURL, vaultRawURL string) 
 		if err := s.VaultURLValidator(platformURL, vaultURL); err == nil {
 			return vaultURL, nil
 		} else {
-			return nil, fmt.Errorf("Platform vault URL was rejected by VaultURLValidator: %w", err)
+			return nil, fmt.Errorf("platform vault URL was rejected by VaultURLValidator: %w", err)
 		}
 	}
-	return nil, fmt.Errorf("Platform returned untrusted vault host %q; add it to AllowedVaultHosts if this on-premises deployment is expected", vaultURL.Host)
+	return nil, fmt.Errorf("platform returned untrusted vault host %q; add it to AllowedVaultHosts if this on-premises deployment is expected", vaultURL.Host)
 }
 
 func isDelineaCloudVaultHost(host string) bool {
@@ -1021,11 +1163,15 @@ func healthCheckError(ssURL string, ssErr error, platformURL string, platformErr
 const maxHealthResponseBytes = 1 << 20
 
 func (s *Server) checkJSONResponse(url string) (bool, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	return s.checkJSONResponseContext(context.Background(), url)
+}
+
+func (s *Server) checkJSONResponseContext(ctx context.Context, url string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false, fmt.Errorf("creating health probe for %s: %w", url, err)
 	}
-	response, err := s.client().Do(req)
+	response, err := s.do(req)
 	if err != nil {
 		return false, fmt.Errorf("probing %s: %w", url, err)
 	}

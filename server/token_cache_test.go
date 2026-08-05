@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -165,6 +167,67 @@ func TestSetCacheAccessTokenSweepsExpiredEntries(t *testing.T) {
 
 	if got, ok := current.getCacheAccessToken(serverURL); !ok || got != "fresh-token" {
 		t.Errorf("current cache = (%q, %v), want (%q, true)", got, ok, "fresh-token")
+	}
+}
+
+func TestTokenCacheIsBounded(t *testing.T) {
+	tokenCacheMu.Lock()
+	original := tokenCache
+	tokenCache = map[string]TokenCache{}
+	tokenCacheMu.Unlock()
+	defer func() {
+		tokenCacheMu.Lock()
+		tokenCache = original
+		tokenCacheMu.Unlock()
+	}()
+
+	for i := 0; i < maxTokenCacheEntries+25; i++ {
+		s := credentialServer(t, fmt.Sprintf("https://cache-bound-%d.example.com", i), "", "user", "password")
+		if err := s.setCacheAccessToken(fmt.Sprintf("token-%d", i), 3600, s.baseURL()); err != nil {
+			t.Fatalf("setCacheAccessToken %d returned error: %v", i, err)
+		}
+	}
+	tokenCacheMu.Lock()
+	entries := len(tokenCache)
+	tokenCacheMu.Unlock()
+	if entries != maxTokenCacheEntries {
+		t.Errorf("cache entries = %d, want bounded at %d", entries, maxTokenCacheEntries)
+	}
+}
+
+func TestTokenFlightWaitHonorsContext(t *testing.T) {
+	s := credentialServer(t, "https://cache-context.example.com", "", "user", "password")
+	s.clearTokenCache()
+	defer s.clearTokenCache()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := s.cachedOrGrantToken(context.Background(), s.baseURL(), func(context.Context) (tokenGrant, error) {
+			close(started)
+			<-release
+			return tokenGrant{accessToken: "token", expiresIn: 3600}, nil
+		})
+		leaderDone <- err
+	}()
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	grantCalled := false
+	_, err := s.cachedOrGrantToken(ctx, s.baseURL(), func(context.Context) (tokenGrant, error) {
+		grantCalled = true
+		return tokenGrant{}, nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("waiting token flight error = %v, want context deadline", err)
+	}
+	if grantCalled {
+		t.Error("waiter started another grant while one was in flight")
+	}
+	close(release)
+	if err := <-leaderDone; err != nil {
+		t.Errorf("leader grant returned error: %v", err)
 	}
 }
 
