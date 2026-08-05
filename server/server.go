@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -81,13 +80,6 @@ func (s *stdLogger) Println(v ...interface{}) {
 var defaultLoggerInstance Logger = &DiscardLogger{}
 
 func init() {
-	// Transport.Clone performs the standard library's one-time HTTP/2 setup on its
-	// receiver. Complete that setup during single-threaded package initialization so
-	// later per-Server clones neither race with nor mutate the process-global default.
-	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
-		cloned := transport.Clone()
-		cloned.CloseIdleConnections()
-	}
 	if _, err := io.ReadFull(rand.Reader, passwordDigestKey[:]); err != nil {
 		panic(fmt.Sprintf("server: initializing token-cache key: %v", err))
 	}
@@ -197,6 +189,7 @@ type TokenCache struct {
 	AccessToken string `json:"access_token"`
 	ExpiresIn   int    `json:"expires_in"`
 	generation  uint64
+	expiresAt   int64
 }
 
 type tokenSource uint8
@@ -237,7 +230,10 @@ var (
 	passwordDigestKey   [32]byte
 )
 
-const maxTokenCacheEntries = 1024
+const (
+	maxTokenCacheEntries         = 1024
+	maxOAuthTokenLifetimeSeconds = 365 * 24 * 60 * 60
+)
 
 // New returns an initialized Secrets object
 func New(config Configuration) (*Server, error) {
@@ -376,7 +372,10 @@ func (s Server) do(req *http.Request) (*http.Response, error) {
 		select {
 		case <-current.Context().Done():
 			if !timer.Stop() {
-				<-timer.C
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 			return nil, current.Context().Err()
 		case <-timer.C:
@@ -440,6 +439,9 @@ func parseRetryAfter(value string) (time.Duration, bool) {
 		return 0, false
 	}
 	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		if seconds > int(maximumRetryDelay/time.Second) {
+			return maximumRetryDelay, true
+		}
 		delay := time.Duration(seconds) * time.Second
 		if delay > maximumRetryDelay {
 			delay = maximumRetryDelay
@@ -711,7 +713,17 @@ func (s *Server) storeCacheAccessToken(value string, expiresIn int, baseURL stri
 	// expires. The previous formula subtracted the 90% instead of the 10%
 	// safety margin, so tokens were re-fetched after a tenth of their
 	// lifetime, forcing ~10x more credential round trips than necessary.
-	cache.ExpiresIn = int(time.Now().Unix()) + int(math.Floor(float64(expiresIn)*0.9))
+	if expiresIn < 0 || expiresIn > maxOAuthTokenLifetimeSeconds {
+		return accessTokenDetails{}, fmt.Errorf("token lifetime is outside the supported range")
+	}
+	cache.expiresAt = time.Now().Unix() + int64(expiresIn*9/10)
+	if strconv.IntSize == 64 {
+		cache.ExpiresIn = int(cache.expiresAt)
+	} else {
+		// Retain the historical exported field without using it for runtime expiry on
+		// 32-bit systems, where current Unix seconds do not fit in int.
+		cache.ExpiresIn = int(^uint(0) >> 1)
+	}
 
 	key := s.cacheKey(baseURL)
 	tokenCacheMu.Lock()
@@ -722,7 +734,7 @@ func (s *Server) storeCacheAccessToken(value string, expiresIn int, baseURL stri
 	// life of the process.
 	now := time.Now().Unix()
 	for key, entry := range tokenCache {
-		if int64(entry.ExpiresIn) <= now {
+		if tokenExpiresAt(entry) <= now {
 			delete(tokenCache, key)
 		}
 	}
@@ -750,7 +762,7 @@ func (s *Server) getCachedToken(baseURL string) (accessTokenDetails, bool) {
 	tokenCacheMu.Lock()
 	defer tokenCacheMu.Unlock()
 	cache, ok := tokenCache[key]
-	if ok && time.Now().Unix() < int64(cache.ExpiresIn) {
+	if ok && time.Now().Unix() < tokenExpiresAt(cache) {
 		return accessTokenDetails{
 			value:      cache.AccessToken,
 			cacheKey:   key,
@@ -768,16 +780,23 @@ func (s *Server) getCachedToken(baseURL string) (accessTokenDetails, bool) {
 
 func evictOldestTokenLocked() {
 	var oldestKey string
-	oldestExpiry := int(^uint(0) >> 1)
+	var oldestExpiry int64
 	for key, cache := range tokenCache {
-		if oldestKey == "" || cache.ExpiresIn < oldestExpiry {
+		if oldestKey == "" || tokenExpiresAt(cache) < oldestExpiry {
 			oldestKey = key
-			oldestExpiry = cache.ExpiresIn
+			oldestExpiry = tokenExpiresAt(cache)
 		}
 	}
 	if oldestKey != "" {
 		delete(tokenCache, oldestKey)
 	}
+}
+
+func tokenExpiresAt(cache TokenCache) int64 {
+	if cache.expiresAt != 0 {
+		return cache.expiresAt
+	}
+	return int64(cache.ExpiresIn)
 }
 
 // cachedOrGrantToken coalesces concurrent cache misses for one credential key. The
@@ -788,7 +807,7 @@ func (s *Server) cachedOrGrantToken(ctx context.Context, baseURL string, grant f
 	key := s.cacheKey(baseURL)
 	now := time.Now().Unix()
 	tokenCacheMu.Lock()
-	if cached, ok := tokenCache[key]; ok && now < int64(cached.ExpiresIn) {
+	if cached, ok := tokenCache[key]; ok && now < tokenExpiresAt(cached) {
 		tokenCacheMu.Unlock()
 		return accessTokenDetails{value: cached.AccessToken, cacheKey: key, generation: cached.generation, source: tokenSourceCache}, nil
 	}
@@ -1062,14 +1081,17 @@ func (s *Server) checkPlatformDetailsContext(ctx context.Context, baseURL string
 }
 
 func validateTokenGrant(accessToken, tokenType string, expiresIn int) error {
-	if accessToken == "" || accessToken != strings.TrimSpace(accessToken) {
-		return fmt.Errorf("access_token is missing or contains surrounding whitespace")
+	if accessToken == "" || strings.IndexFunc(accessToken, func(r rune) bool { return r <= ' ' || r == '\u007f' }) >= 0 {
+		return fmt.Errorf("access_token is missing or contains whitespace or control characters")
 	}
 	if tokenType != "" && !strings.EqualFold(tokenType, "Bearer") {
 		return fmt.Errorf("unsupported token_type %q", tokenType)
 	}
 	if expiresIn <= 0 {
 		return fmt.Errorf("expires_in must be greater than zero")
+	}
+	if expiresIn > maxOAuthTokenLifetimeSeconds {
+		return fmt.Errorf("expires_in exceeds the supported maximum of %d seconds", maxOAuthTokenLifetimeSeconds)
 	}
 	return nil
 }
@@ -1108,7 +1130,9 @@ func (s *Server) validateDiscoveredVaultURL(platformRawURL, vaultRawURL string) 
 		return vaultURL, nil
 	}
 	if s.VaultURLValidator != nil {
-		if err := s.VaultURLValidator(platformURL, vaultURL); err == nil {
+		platformForValidation := *platformURL
+		vaultForValidation := *vaultURL
+		if err := s.VaultURLValidator(&platformForValidation, &vaultForValidation); err == nil {
 			return vaultURL, nil
 		} else {
 			return nil, fmt.Errorf("platform vault URL was rejected by VaultURLValidator: %w", err)

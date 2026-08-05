@@ -39,8 +39,13 @@ func TestNewDoesNotMutateDefaultTransport(t *testing.T) {
 		t.Fatalf("New returned error: %v", err)
 	}
 
-	if after := defaultTransportTLSConfig(t); after != before {
-		t.Errorf("http.DefaultTransport.TLSClientConfig was mutated: got %p, want %p", after, before)
+	if after := defaultTransportTLSConfig(t); after == tlsConfig {
+		t.Error("the caller's TLSClientConfig leaked onto http.DefaultTransport")
+	} else if after != nil && after != before && (after.InsecureSkipVerify || after.RootCAs != nil || after.Certificates != nil) {
+		// Transport.Clone may perform synchronized, one-time HTTP/2 initialization on
+		// the source transport. That standard-library internal config is acceptable;
+		// any caller-controlled verification state is not.
+		t.Error("http.DefaultTransport acquired caller-controlled TLS verification state")
 	}
 
 	transport, ok := s.client().Transport.(*http.Transport)
@@ -190,7 +195,16 @@ func TestInjectedClientBehaviorIsPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cookiejar.New returned error: %v", err)
 	}
-	base := &http.Client{Transport: transport, Jar: jar, Timeout: 13 * time.Second}
+	redirectPolicyCalled := false
+	base := &http.Client{
+		Transport: transport,
+		Jar:       jar,
+		Timeout:   13 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			redirectPolicyCalled = true
+			return nil
+		},
+	}
 	s, err := New(Configuration{ServerURL: "https://example.com", HTTPClient: base})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
@@ -203,6 +217,60 @@ func TestInjectedClientBehaviorIsPreserved(t *testing.T) {
 	}
 	if s.client().Timeout != base.Timeout {
 		t.Errorf("timeout = %v, want injected %v", s.client().Timeout, base.Timeout)
+	}
+	redirected := httptest.NewRequest(http.MethodGet, "https://example.com/after", nil)
+	via := []*http.Request{httptest.NewRequest(http.MethodGet, "https://example.com/before", nil)}
+	if err := s.client().CheckRedirect(redirected, via); err != nil {
+		t.Errorf("same-origin injected redirect policy returned error: %v", err)
+	}
+	if !redirectPolicyCalled {
+		t.Error("New did not preserve the injected redirect policy")
+	}
+}
+
+func TestTLSClonePreservesAllOperationalTransportSettings(t *testing.T) {
+	source := &http.Transport{
+		ProxyConnectHeader:     http.Header{"Proxy-Authorization": []string{"Basic opaque"}},
+		DisableKeepAlives:      true,
+		DisableCompression:     true,
+		MaxIdleConns:           17,
+		MaxIdleConnsPerHost:    9,
+		MaxConnsPerHost:        11,
+		ResponseHeaderTimeout:  7 * time.Second,
+		ExpectContinueTimeout:  3 * time.Second,
+		MaxResponseHeaderBytes: 12345,
+		ReadBufferSize:         4096,
+		WriteBufferSize:        8192,
+	}
+	s, err := New(Configuration{
+		ServerURL:       "https://example.com",
+		HTTPClient:      &http.Client{Transport: source},
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	cloned, ok := s.client().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", s.client().Transport)
+	}
+	if cloned == source {
+		t.Fatal("New reused the caller's mutable transport")
+	}
+	if cloned.ProxyConnectHeader.Get("Proxy-Authorization") != "Basic opaque" ||
+		!cloned.DisableKeepAlives || !cloned.DisableCompression ||
+		cloned.MaxIdleConns != source.MaxIdleConns ||
+		cloned.MaxIdleConnsPerHost != source.MaxIdleConnsPerHost ||
+		cloned.MaxConnsPerHost != source.MaxConnsPerHost ||
+		cloned.ResponseHeaderTimeout != source.ResponseHeaderTimeout ||
+		cloned.ExpectContinueTimeout != source.ExpectContinueTimeout ||
+		cloned.MaxResponseHeaderBytes != source.MaxResponseHeaderBytes ||
+		cloned.ReadBufferSize != source.ReadBufferSize ||
+		cloned.WriteBufferSize != source.WriteBufferSize {
+		t.Errorf("transport clone lost operational settings: got %+v, source %+v", cloned, source)
+	}
+	if cloned.TLSClientConfig == nil || cloned.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Error("transport clone did not apply the configured TLS minimum")
 	}
 }
 

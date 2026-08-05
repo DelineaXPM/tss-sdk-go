@@ -127,31 +127,51 @@ func TestSearchAndUploadClearTokenCacheOnAuthFailure(t *testing.T) {
 }
 
 func TestSuppliedTokenFailureDoesNotEvictPasswordGrantCache(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer ts.Close()
+	operations := []struct {
+		name string
+		call func(*Server) error
+	}{
+		{name: "access", call: func(s *Server) error {
+			_, err := s.accessResource(http.MethodGet, "secrets", "1", nil)
+			return err
+		}},
+		{name: "search", call: func(s *Server) error {
+			_, err := s.searchResources("secrets", "term", "")
+			return err
+		}},
+		{name: "upload", call: func(s *Server) error {
+			return s.uploadFile(1, SecretField{Slug: "file", Filename: "file.txt", ItemValue: "contents"})
+		}},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+			}))
+			defer ts.Close()
 
-	s, err := New(Configuration{
-		ServerURL: ts.URL,
-		Credentials: UserCredential{
-			Username: "frank",
-			Password: "pw",
-			Token:    "caller-supplied-token",
-		},
-	})
-	if err != nil {
-		t.Fatalf("New returned error: %v", err)
-	}
-	if err := s.setCacheAccessToken("password-grant-token", 3600, ts.URL); err != nil {
-		t.Fatalf("setCacheAccessToken returned error: %v", err)
-	}
+			s, err := New(Configuration{
+				ServerURL: ts.URL,
+				Credentials: UserCredential{
+					Username: "frank",
+					Password: "pw",
+					Token:    "caller-supplied-token",
+				},
+			})
+			if err != nil {
+				t.Fatalf("New returned error: %v", err)
+			}
+			if err := s.setCacheAccessToken("password-grant-token", 3600, ts.URL); err != nil {
+				t.Fatalf("setCacheAccessToken returned error: %v", err)
+			}
 
-	if _, err := s.accessResource(http.MethodGet, "secrets", "1", nil); err == nil {
-		t.Fatal("expected the supplied token to be rejected")
-	}
-	if token, found := s.getCacheAccessToken(ts.URL); !found || token != "password-grant-token" {
-		t.Errorf("password-grant cache = (%q, %v), want it unchanged", token, found)
+			if err := operation.call(s); err == nil {
+				t.Fatal("expected the supplied token to be rejected")
+			}
+			if token, found := s.getCacheAccessToken(ts.URL); !found || token != "password-grant-token" {
+				t.Errorf("password-grant cache = (%q, %v), want it unchanged", token, found)
+			}
+		})
 	}
 }
 
