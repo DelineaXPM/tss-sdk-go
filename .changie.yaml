@@ -1,0 +1,63 @@
+changesDir: .changes
+unreleasedDir: unreleased
+headerPath: header.tpl.md
+changelogPath: CHANGELOG.md
+versionExt: md
+versionFormat: '## {{.Version}} - {{.Time.Format "2006-01-02"}}'
+kindFormat: ''
+changeFormat: '- _{{.Kind}}_: {{ .Body -}}'
+body:
+  block: true
+kinds:
+  - key: ci-and-build
+    label: 🤖 CI & Build
+    auto: none
+  - key: new-product-feature
+    label: 🎉 New Product Feature
+    auto: minor
+  - key: deprecated
+    label: ⬇️ Deprecated
+    auto: minor
+  - key: tests
+    label: 🧪 Tests
+    auto: patch
+  - key: refactor
+    label: 🔨 Refactor
+    auto: patch
+  - key: bug-fix
+    label: 🐛 Bug Fix
+    auto: patch
+  - key: breaking-change
+    label: 🔥 Breaking Change
+    auto: minor
+  - key: security
+    label: 🔒 Security
+    auto: patch
+  - key: dependencies
+    label: ⬆️ Dependencies
+    auto: patch
+  - key: major-version-change-breaking-changes
+    label: 🔥 Major Version Change (Breaking Changes)
+    auto: major
+newlines:
+  afterChange: 0
+  afterChangelogHeader: 1
+  afterChangelogVersion: 1
+  afterComponent: 1
+  afterFooterFile: 1
+  afterFooter: 1
+  afterHeaderFile: 1
+  afterHeaderTemplate: 1
+  afterKind: 1
+  afterVersion: 1
+
+  beforeChange: 0
+  beforeChangelogVersion: 0
+  beforeComponent: 0
+  beforeFooterFile: 0
+  beforeFooterTemplate: 0
+  beforeHeaderFile: 0
+  beforeHeaderTemplate: 0
+  beforeKind: 1
+  beforeVersion: 0
+  endOfVersion: 0
