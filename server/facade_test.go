@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -9,13 +10,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func writeGrant(w http.ResponseWriter) {
@@ -198,7 +204,7 @@ func TestFacadeHTTPErrorUsesRequestBoundRedaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.Secret(1)
+	_, err = client.SecretTemplate(1)
 	var httpErr *HTTPError
 	if !errors.As(err, &httpErr) {
 		t.Fatalf("got %T %v, want *HTTPError", err, err)
@@ -208,6 +214,28 @@ func TestFacadeHTTPErrorUsesRequestBoundRedaction(t *testing.T) {
 	}
 	if strings.Contains(httpErr.Error(), token) || !strings.Contains(httpErr.Error(), "[REDACTED]") {
 		t.Fatalf("unsafe diagnostic: %v", httpErr)
+	}
+}
+
+func TestFacadeSecretReadErrorWithholdsResponseBody(t *testing.T) {
+	const responseSecret = "response-contained-password"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, responseSecret, http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "read-error-token"}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Secret(1)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("got %T %v, want *HTTPError", err, err)
+	}
+	if strings.Contains(httpErr.Error(), responseSecret) || httpErr.Body != withheldDiagnostic {
+		t.Fatalf("unsafe secret-read diagnostic: %v", httpErr)
 	}
 }
 
@@ -307,6 +335,39 @@ func TestFacadeTLSConfigIsServerScoped(t *testing.T) {
 	}
 	if http.DefaultTransport != defaultTransport {
 		t.Fatal("New mutated http.DefaultTransport")
+	}
+}
+
+func TestFacadeTLSConfigMutableFieldsAreSnapshotted(t *testing.T) {
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeSecret(w, 4)
+	}))
+	t.Cleanup(tlsServer.Close)
+	callerPool := x509.NewCertPool()
+	client, err := New(Configuration{
+		ServerURL: tlsServer.URL, Credentials: UserCredential{Token: "tls-snapshot-token"},
+		TLSClientConfig: &tls.Config{RootCAs: callerPool}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerPool.AddCert(tlsServer.Certificate())
+	client.TLSClientConfig.RootCAs.AddCert(tlsServer.Certificate())
+	if _, err := client.Secret(4); err == nil {
+		t.Fatal("mutating a caller-visible CA pool changed the live client trust boundary")
+	}
+
+	trustedPool := x509.NewCertPool()
+	trustedPool.AddCert(tlsServer.Certificate())
+	trusted, err := New(Configuration{
+		ServerURL: tlsServer.URL, Credentials: UserCredential{Token: "tls-snapshot-token"},
+		TLSClientConfig: &tls.Config{RootCAs: trustedPool}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trusted.Secret(4); err != nil {
+		t.Fatalf("snapshotted trusted pool was not applied: %v", err)
 	}
 }
 
@@ -614,6 +675,63 @@ func TestFacadeAdopts401RefreshAnd403AuthorizationPolicy(t *testing.T) {
 	}
 }
 
+func TestFacadeRecoversFromSecretServerExpiredToken403(t *testing.T) {
+	var grants, reads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/healthcheck":
+			fmt.Fprint(w, `{"healthy":true}`)
+		case "/oauth2/token":
+			grant := grants.Add(1)
+			fmt.Fprintf(w, `{"access_token":"expired-policy-token-%d","token_type":"Bearer","expires_in":3600}`, grant)
+		case "/api/v1/secrets/15":
+			switch reads.Add(1) {
+			case 1:
+				writeSecret(w, 15) // prime and retain the first token
+			case 2:
+				if got := r.Header.Get("Authorization"); got != "Bearer expired-policy-token-1" {
+					t.Errorf("stale request authorization = %q, want first token", got)
+				}
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, `{"message":"Authentication failed or expired token."}`)
+			case 3:
+				if got := r.Header.Get("Authorization"); got != "Bearer expired-policy-token-2" {
+					t.Errorf("replayed request authorization = %q, want refreshed token", got)
+				}
+				writeSecret(w, 15)
+			default:
+				t.Errorf("unexpected secret read %d", reads.Load())
+				http.Error(w, "unexpected request", http.StatusInternalServerError)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := New(Configuration{
+		ServerURL:      srv.URL,
+		Credentials:    UserCredential{Username: "expired-policy-user", Password: "expired-policy-password"},
+		DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Secret(15); err != nil {
+		t.Fatal(err)
+	}
+	secret, err := client.Secret(15)
+	if err != nil {
+		t.Fatalf("expired-token recovery failed: %v", err)
+	}
+	if secret.ID != 15 {
+		t.Errorf("secret ID = %d, want 15", secret.ID)
+	}
+	if grants.Load() != 2 || reads.Load() != 3 {
+		t.Fatalf("grants=%d reads=%d, want 2 and 3", grants.Load(), reads.Load())
+	}
+}
+
 func TestFacadeRetryAndResponseLimitMapping(t *testing.T) {
 	t.Run("MaxRetries counts retries", func(t *testing.T) {
 		var attempts atomic.Int32
@@ -905,4 +1023,482 @@ func TestFacadeCrossServerCacheDependsOnTLSOpacity(t *testing.T) {
 			t.Fatalf("grants=%d, want one shared grant", grants.Load())
 		}
 	})
+}
+
+func TestFacadeRequestBodiesAreBounded(t *testing.T) {
+	var writes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/secret-templates/1":
+			fmt.Fprint(w, `{"ID":1,"Fields":[{"SecretTemplateFieldID":10,"FieldSlugName":"notes"}]}`)
+		case "/api/v1/secrets/":
+			writes.Add(1)
+			fmt.Fprint(w, `{"ID":1}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "request-limit-token"},
+		MaxRequestBytes: 2048, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateSecret(Secret{
+		SecretTemplateID: 1,
+		Fields:           []SecretField{{Slug: "notes", ItemValue: strings.Repeat("x", 4096)}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "request body exceeded 2048 bytes") {
+		t.Fatalf("got %v, want request-size error", err)
+	}
+	if writes.Load() != 0 {
+		t.Fatalf("oversized request reached the server %d times", writes.Load())
+	}
+}
+
+func TestRequestSizePreflightsMatchEncodedBodies(t *testing.T) {
+	secret := Secret{
+		Name: "<name>\n\ufffd",
+		Fields: []SecretField{{
+			FieldName: "field", Slug: "slug", FieldDescription: "description",
+			Filename: "file.txt", ItemValue: string([]byte{'a', 0xff, '\t'}),
+		}},
+	}
+	encoded, err := json.Marshal(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size, err := secretJSONSize(secret, math.MaxInt64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != int64(len(encoded)) {
+		t.Fatalf("JSON preflight=%d encoded=%d", size, len(encoded))
+	}
+
+	filename := "safe\r\nquoted\"\\.txt"
+	wantSize, err := multipartBodySize(filename, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(part, "1234567")
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if wantSize != int64(body.Len()) {
+		t.Fatalf("multipart preflight=%d encoded=%d", wantSize, body.Len())
+	}
+
+	extensionless := "private-key"
+	wantSize, err = multipartBodySizeParts(extensionless, ".txt", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Reset()
+	writer = multipart.NewWriter(&body)
+	part, err = writer.CreateFormFile("file", extensionless+".txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(part, "1234567")
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if wantSize != int64(body.Len()) {
+		t.Fatalf("multipart suffix preflight=%d encoded=%d", wantSize, body.Len())
+	}
+
+	patch := newFileDeletionPatch("unsafe\nslug\ufffd")
+	encodedPatch, err := json.Marshal(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fileDeletionPatchJSONSize("unsafe\nslug\ufffd"); got != int64(len(encodedPatch)) {
+		t.Fatalf("file patch preflight=%d encoded=%d", got, len(encodedPatch))
+	}
+}
+
+func TestFacadeCreateReturnsPartialResultAfterAttachmentFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/secret-templates/1":
+			fmt.Fprint(w, `{"ID":1,"Fields":[{"SecretTemplateFieldID":10,"FieldSlugName":"file","IsFile":true}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/secrets/":
+			fmt.Fprint(w, `{"ID":77}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/secrets/77/fields/file":
+			http.Error(w, "upload rejected", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "partial-write-token"}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.CreateSecret(Secret{
+		SecretTemplateID: 1,
+		Fields:           []SecretField{{Slug: "file", Filename: "a.txt", ItemValue: "contents"}},
+	})
+	var partial *PartialWriteError
+	if result == nil || result.ID != 77 || !errors.As(err, &partial) || partial.SecretID != 77 {
+		t.Fatalf("result=%+v error=%T %v partial=%+v", result, err, err, partial)
+	}
+}
+
+func TestFacadeSearchPaginatesAndHonorsResultLimit(t *testing.T) {
+	var searchCalls atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/secrets" {
+			searchCalls.Add(1)
+			skip, _ := strconv.Atoi(r.URL.Query().Get("paging.skip"))
+			count := 0
+			switch skip {
+			case 0:
+				count = searchPageSize
+			case searchPageSize:
+				count = 1
+			}
+			records := make([]Secret, count)
+			for i := range records {
+				records[i].ID = skip + i + 1
+			}
+			_ = json.NewEncoder(w).Encode(SearchResult{Records: records})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/secrets/") {
+			id, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/api/v1/secrets/"))
+			writeSecret(w, id)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "pagination-token"}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets, err := client.Secrets("test", "Name")
+	if err != nil || len(secrets) != searchPageSize+1 || searchCalls.Load() != 2 {
+		t.Fatalf("len=%d calls=%d error=%v", len(secrets), searchCalls.Load(), err)
+	}
+
+	limited, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "pagination-token"},
+		MaxSearchResults: searchPageSize, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := limited.Secrets("test", "Name"); err == nil || !strings.Contains(err.Error(), "search exceeded 30 results") {
+		t.Fatalf("got %v, want search limit error", err)
+	}
+}
+
+func TestLocalErrorsNeutralizeRecordSeparators(t *testing.T) {
+	_, updateErr := (Server{}).UpdateSecretContext(context.Background(), Secret{
+		ID: 1, Name: "safe\nFORGED\u2028FORGED", SshKeyArgs: &SshKeyArgs{GenerateSshKeys: true},
+	})
+	template := &SecretTemplate{Name: "template\rFORGED\u2029FORGED"}
+	_, templateErr := (Server{}).GeneratePasswordContext(context.Background(), "slug\nFORGED\u2028FORGED", template)
+	for name, err := range map[string]error{"update": updateErr, "template": templateErr} {
+		if err == nil || strings.ContainsAny(err.Error(), "\r\n\u2028\u2029") {
+			t.Errorf("%s error retained a record separator: %q", name, err)
+		}
+	}
+}
+
+func TestGeneratePasswordRejectsNonpositiveFieldIDWithoutRequest(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "generate-password-id-token"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int{0, -1} {
+		template := &SecretTemplate{
+			Name: "invalid", Fields: []SecretTemplateField{{SecretTemplateFieldID: id, FieldSlugName: "password"}},
+		}
+		if _, err := client.GeneratePassword("password", template); err == nil ||
+			!strings.Contains(err.Error(), "nonpositive ID") {
+			t.Errorf("field ID %d: got %v, want nonpositive-ID error", id, err)
+		}
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("invalid field IDs reached the server %d times", requests.Load())
+	}
+}
+
+func TestFacadeRejectsInvalidWriteResponseIDsBeforeFollowups(t *testing.T) {
+	var followups atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/secret-templates/1":
+			fmt.Fprint(w, `{"ID":1,"Fields":[]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/secrets/":
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/secrets/77":
+			fmt.Fprint(w, `{"ID":88,"Name":"wrong object"}`)
+		default:
+			followups.Add(1)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "write-id-token"}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := client.CreateSecret(Secret{SecretTemplateID: 1})
+	var partial *PartialWriteError
+	if created == nil || created.ID != 0 || !errors.As(err, &partial) ||
+		partial.SecretID != 0 || partial.Stage != "validating the write response" {
+		t.Fatalf("create result=%+v error=%T %v partial=%+v", created, err, err, partial)
+	}
+
+	updated, err := client.UpdateSecret(Secret{ID: 77, SecretTemplateID: 1})
+	partial = nil
+	if updated == nil || updated.ID != 77 || !errors.As(err, &partial) ||
+		partial.SecretID != 77 || partial.Stage != "validating the write response" {
+		t.Fatalf("update result=%+v error=%T %v partial=%+v", updated, err, err, partial)
+	}
+	if updated.Name != "" {
+		t.Fatalf("mismatched update response leaked untrusted fields into the partial result: %+v", updated)
+	}
+	if followups.Load() != 0 {
+		t.Fatalf("invalid response IDs triggered %d follow-up requests", followups.Load())
+	}
+}
+
+func TestFacadeMalformedCreateResponseDoesNotExposePartialIdentity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/secret-templates/1":
+			fmt.Fprint(w, `{"ID":1,"Fields":[]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/secrets/":
+			// ID and Name are populated by json.Unmarshal before it reaches the
+			// malformed tail. Neither value is trustworthy after decoding fails.
+			fmt.Fprint(w, `{"ID":77,"Name":"untrusted"`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "malformed-create-token"}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := client.CreateSecret(Secret{SecretTemplateID: 1})
+	var partial *PartialWriteError
+	if created == nil || created.ID != 0 || created.Name != "" || !errors.As(err, &partial) ||
+		partial.SecretID != 0 || partial.Stage != "decoding the write response" {
+		t.Fatalf("create result=%+v error=%T %v partial=%+v", created, err, err, partial)
+	}
+}
+
+func TestFacadeFileFieldIDCarriesResolvedSlugIntoUpload(t *testing.T) {
+	var uploads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/secret-templates/1":
+			fmt.Fprint(w, `{"ID":1,"Fields":[{"SecretTemplateFieldID":10,"FieldSlugName":"file","IsFile":true}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/secrets/":
+			fmt.Fprint(w, `{"ID":77}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/secrets/77/fields/file":
+			uploads.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/secrets/77":
+			fmt.Fprint(w, `{"ID":77}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "field-id-token"}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := client.CreateSecret(Secret{
+		SecretTemplateID: 1,
+		Fields:           []SecretField{{FieldID: 10, Filename: "a.txt", ItemValue: "contents"}},
+	})
+	if err != nil || created == nil || created.ID != 77 || uploads.Load() != 1 {
+		t.Fatalf("create result=%+v uploads=%d error=%v", created, uploads.Load(), err)
+	}
+}
+
+func TestFacadeDoesNotFollowMutationRedirect(t *testing.T) {
+	var initial, redirected atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/secret-templates/1":
+			fmt.Fprint(w, `{"ID":1,"Fields":[]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/secrets/":
+			initial.Add(1)
+			http.Redirect(w, r, "/redirected", http.StatusTemporaryRedirect)
+		case r.URL.Path == "/redirected":
+			redirected.Add(1)
+			fmt.Fprint(w, `{"ID":77}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "mutation-redirect-token"}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.CreateSecret(Secret{SecretTemplateID: 1}); err == nil {
+		t.Fatal("mutation redirect was accepted")
+	}
+	if initial.Load() != 1 || redirected.Load() != 0 {
+		t.Fatalf("requests: initial=%d redirected=%d, want 1 and 0", initial.Load(), redirected.Load())
+	}
+}
+
+func TestFacadeRejectsNonpositiveDeleteIDsWithoutRequest(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "delete-id-token"}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range []int{0, -1} {
+		if err := client.DeleteSecret(id); err == nil || !strings.Contains(err.Error(), "secret ID must be positive") {
+			t.Errorf("DeleteSecret(%d): got %v", id, err)
+		}
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("nonpositive deletes made %d requests", requests.Load())
+	}
+}
+
+func TestFacadeValidatesReadResponseIDsBeforeFollowups(t *testing.T) {
+	var attachmentRequests, writes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/secrets/7":
+			fmt.Fprint(w, `{"ID":8,"Items":[{"Slug":"file","IsFile":true,"FileAttachmentID":1,"Filename":"file.txt"}]}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/secrets/0":
+			fmt.Fprint(w, `{"ID":0,"Items":[{"Slug":"file","IsFile":true,"FileAttachmentID":1,"Filename":"file.txt"}]}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/secret-templates/4":
+			fmt.Fprint(w, `{"ID":5,"Fields":[]}`)
+		case strings.Contains(r.URL.Path, "/fields/"):
+			attachmentRequests.Add(1)
+			fmt.Fprint(w, "unexpected attachment")
+		case r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch:
+			writes.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "response-id-token"}, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.Secret(0); err == nil || !strings.Contains(err.Error(), "secret ID must be positive") {
+		t.Fatalf("zero requested secret ID: %v", err)
+	}
+	if _, err := client.SecretTemplate(0); err == nil || !strings.Contains(err.Error(), "secret template ID must be positive") {
+		t.Fatalf("zero requested template ID: %v", err)
+	}
+	if _, err := client.Secret(7); err == nil || !strings.Contains(err.Error(), "response ID 8 does not match the requested ID 7") {
+		t.Fatalf("mismatched secret response: %v", err)
+	}
+	if _, err := client.SecretByPath("/folder/secret"); err == nil || !strings.Contains(err.Error(), "no positive secret ID") {
+		t.Fatalf("zero secret-by-path response ID: %v", err)
+	}
+	if _, err := client.SecretTemplate(4); err == nil || !strings.Contains(err.Error(), "response ID 5 does not match the requested ID 4") {
+		t.Fatalf("mismatched template response: %v", err)
+	}
+	if _, err := client.CreateSecret(Secret{SecretTemplateID: 4}); err == nil || !strings.Contains(err.Error(), "response ID 5 does not match the requested ID 4") {
+		t.Fatalf("create with mismatched template response: %v", err)
+	}
+	if attachmentRequests.Load() != 0 || writes.Load() != 0 {
+		t.Fatalf("untrusted response identities triggered attachment requests=%d writes=%d", attachmentRequests.Load(), writes.Load())
+	}
+}
+
+func TestRequestTargetPreflightsMatchStandardEscaping(t *testing.T) {
+	allBytes := make([]byte, 256)
+	for i := range allBytes {
+		allBytes[i] = byte(i)
+	}
+	values := []string{"", "plain text", "slashes/and?query=value", string(allBytes), "世界"}
+	for _, value := range values {
+		if got, want := queryEscapedLength(value), int64(len(url.QueryEscape(value))); got != want {
+			t.Errorf("query length for %q = %d, want %d", value, got, want)
+		}
+		if got, want := pathEscapedLength(value), int64(len(url.PathEscape(value))); got != want {
+			t.Errorf("path length for %q = %d, want %d", value, got, want)
+		}
+	}
+	query := url.Values{"z": {"one", "two words"}, "a": {"/"}}
+	if got, want := requestTargetLength("/base", query), int64(len("/base?"+query.Encode())); got != want {
+		t.Fatalf("request target length = %d, want %d", got, want)
+	}
+
+	server := Server{Configuration: Configuration{apiPathURI: "api/v1"}}
+	prefix, segment := "1/fields/", strings.Repeat("/", 100)
+	server.MaxRequestBytes = joinedLength(int64(len(server.requestPath(resource, prefix))), pathEscapedLength(segment)) - 1
+	if _, err := server.pathWithEscapedSegment(resource, prefix, segment); err == nil {
+		t.Fatal("oversized escaped path was accepted")
+	}
+}
+
+func TestDiagnosticsRemainSingleLineValidUTF8(t *testing.T) {
+	value := strings.Repeat("a", errorBodyLength-1) + "é\u2028FORGED\u2029"
+	got := truncateDiagnostic(value, errorBodyLength)
+	if !utf8.ValidString(got) {
+		t.Fatalf("diagnostic is invalid UTF-8: %q", got)
+	}
+	if strings.ContainsAny(got, "\r\n\u2028\u2029") {
+		t.Fatalf("diagnostic retained a record separator: %q", got)
+	}
+	if got := truncateDiagnostic(strings.Repeat("x", errorBodyLength), errorBodyLength); strings.HasSuffix(got, "...") {
+		t.Fatalf("exact-length diagnostic was marked truncated: %q", got)
+	}
 }

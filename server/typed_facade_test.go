@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -150,7 +151,8 @@ func TestFacadeMultipartAndGeneratedPasswordContracts(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	if err := client.uploadFile(22, SecretField{Slug: "private-key", Filename: "key", ItemValue: "private material"}); err != nil {
+	if err := client.uploadFileContextWithBudget(context.Background(), 22,
+		SecretField{Slug: "private-key", Filename: "key", ItemValue: "private material"}, client.newOperationBudget()); err != nil {
 		t.Fatal(err)
 	}
 	template := &SecretTemplate{Name: "Password", Fields: []SecretTemplateField{{SecretTemplateFieldID: 5, FieldSlugName: "password"}}}

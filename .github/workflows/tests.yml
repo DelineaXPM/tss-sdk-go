@@ -3,8 +3,7 @@ name: Tests
 on:
   workflow_dispatch:
   push:
-    branches: [main, delegate-to-delinea-tools]
-    tags: ['v*']
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -12,8 +11,7 @@ permissions:
   contents: read
 
 env:
-  GOPRIVATE: github.com/DelineaXPM/*
-  GONOSUMDB: github.com/DelineaXPM/*
+  GOWORK: 'off'
 
 jobs:
   verify:
@@ -25,13 +23,8 @@ jobs:
         with:
           go-version: '1.26.6'
           check-latest: true
-      - name: Authenticate private delinea-tools dependency
-        env:
-          READ_TOKEN: ${{ secrets.DELINEA_TOOLS_READ_TOKEN }}
-        run: |
-          test -n "$READ_TOKEN"
-          git config --global url."https://x-access-token:${READ_TOKEN}@github.com/".insteadOf "https://github.com/"
       - run: go mod download
+      - run: go mod verify
       - run: go build -v ./...
       - run: go test -race ./...
 
@@ -44,13 +37,8 @@ jobs:
         with:
           go-version: '1.26.6'
           check-latest: true
-      - name: Authenticate private delinea-tools dependency
-        env:
-          READ_TOKEN: ${{ secrets.DELINEA_TOOLS_READ_TOKEN }}
-        run: |
-          test -n "$READ_TOKEN"
-          git config --global url."https://x-access-token:${READ_TOKEN}@github.com/".insteadOf "https://github.com/"
       - run: go mod download
+      - run: go mod verify
       - run: go vet ./...
       - run: |
           go install honnef.co/go/tools/cmd/staticcheck@2026.1
@@ -58,16 +46,21 @@ jobs:
       - run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
           govulncheck ./...
+      - run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
+          gosec -quiet ./...
 
   integration:
     name: Live Secret Server and Platform
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    environment: live-tests
     concurrency:
       group: live-tenant-battery
       cancel-in-progress: false
     env:
-      TSS_REQUIRE_SECRET_SERVER: ${{ secrets.TSS_USERNAME != '' && '1' || '' }}
-      TSS_REQUIRE_PLATFORM: ${{ secrets.TSS_PLATFORM_USERNAME != '' && secrets.TSS_PLATFORM_SECRET_ID != '' && '1' || '' }}
+      TSS_REQUIRE_SECRET_SERVER: '1'
+      TSS_REQUIRE_PLATFORM: '1'
       TSS_TENANT: ${{ secrets.TSS_TENANT }}
       TSS_SERVER_URL: ${{ secrets.TSS_SERVER_URL }}
       TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
@@ -100,10 +93,5 @@ jobs:
         with:
           go-version: '1.26.6'
           check-latest: true
-      - name: Authenticate private delinea-tools dependency
-        env:
-          READ_TOKEN: ${{ secrets.DELINEA_TOOLS_READ_TOKEN }}
-        run: |
-          test -n "$READ_TOKEN"
-          git config --global url."https://x-access-token:${READ_TOKEN}@github.com/".insteadOf "https://github.com/"
+      - run: go mod download
       - run: go test -race -v ./server

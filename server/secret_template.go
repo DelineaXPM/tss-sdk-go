@@ -38,6 +38,9 @@ func (s Server) SecretTemplateContext(ctx context.Context, id int) (*SecretTempl
 }
 
 func (s Server) secretTemplateContext(ctx context.Context, id int, budget *operationBudget) (*SecretTemplate, error) {
+	if id <= 0 {
+		return nil, fmt.Errorf("secret template ID must be positive")
+	}
 	secretTemplate := new(SecretTemplate)
 
 	if data, err := s.accessResourceContextWithBudget(ctx, http.MethodGet, templateResource, strconv.Itoa(id), nil, budget); err == nil {
@@ -47,6 +50,9 @@ func (s Server) secretTemplateContext(ctx context.Context, id int, budget *opera
 		}
 	} else {
 		return nil, err
+	}
+	if secretTemplate.ID != id {
+		return nil, fmt.Errorf("secret template response ID %d does not match the requested ID %d", secretTemplate.ID, id)
 	}
 
 	return secretTemplate, nil
@@ -70,7 +76,12 @@ func (s Server) GeneratePasswordContext(ctx context.Context, slug string, templa
 	fieldId, found := template.FieldSlugToId(slug)
 
 	if !found {
-		return "", fmt.Errorf("the alias '%s' does not identify a field on the template named '%s'", slug, template.Name)
+		return "", fmt.Errorf("the alias %q does not identify a field on the template named %q",
+			sanitizeLogText(slug), sanitizeLogText(template.Name))
+	}
+	if fieldId <= 0 {
+		return "", fmt.Errorf("the alias %q identifies a field with a nonpositive ID on the template named %q",
+			sanitizeLogText(slug), sanitizeLogText(template.Name))
 	}
 	path := fmt.Sprintf("generate-password/%d", fieldId)
 

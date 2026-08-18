@@ -1,31 +1,167 @@
-name: goreleaser
+name: Verify and create release tag
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable v3 tag to create after verification
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GOWORK: 'off'
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
-  goreleaser:
+  validate:
+    name: Validate release request
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate the requested release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "refusing to release from $GITHUB_REF; dispatch this workflow from main" >&2
+            exit 1
+          fi
+          stable_v3='^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$RELEASE_TAG" =~ $stable_v3 ]]; then
+            echo "refusing non-stable or non-v3 tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG"; then
+            echo "refusing to replace existing tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+  verify:
+    name: Offline release verification
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.26.6'
+          check-latest: true
+      - name: Require the public stable delinea-common API
+        run: |
+          replacements="$(go mod edit -json | jq '.Replace | length')"
+          if [[ "$replacements" != 0 ]]; then
+            echo "refusing release with module replacements" >&2
+            go mod edit -json | jq '.Replace' >&2
+            exit 1
+          fi
+          version="$(go list -m -f '{{.Version}}' github.com/DelineaXPM/delinea-common)"
+          stable_v1='^v1\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z.-]+)?$'
+          if [[ ! "$version" =~ $stable_v1 ]]; then
+            echo "refusing release with delinea-common $version; require a stable public v1 release" >&2
+            exit 1
+          fi
+      - run: go mod download
+      - run: go mod verify
+      - run: go mod tidy -diff
+      - name: Require the reviewed two-module graph
+        run: |
+          unexpected="$(go list -m all | awk '$1 != "github.com/DelineaXPM/tss-sdk-go/v3" && $1 != "github.com/DelineaXPM/delinea-common"')"
+          if [[ -n "$unexpected" ]]; then
+            echo "refusing release with unreviewed transitive modules:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
+      - run: go build -v ./...
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2026.1
+          staticcheck ./...
+      - run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+      - run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
+          gosec -quiet ./...
+
+  integration:
+    name: Required live Secret Server and Platform battery
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: live-tests
+    concurrency:
+      group: live-tenant-battery
+      cancel-in-progress: false
+    env:
+      TSS_REQUIRE_SECRET_SERVER: '1'
+      TSS_REQUIRE_PLATFORM: '1'
+      TSS_TENANT: ${{ secrets.TSS_TENANT }}
+      TSS_SERVER_URL: ${{ secrets.TSS_SERVER_URL }}
+      TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
+      TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
+      TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
+      TSS_SECRET_PATH: ${{ secrets.TSS_SECRET_PATH }}
+      TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
+      TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
+      TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
+      TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
+      TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
+      TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
+      TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
+      TSS_PLATFORM_USERNAME: ${{ secrets.TSS_PLATFORM_USERNAME }}
+      TSS_PLATFORM_PASSWORD: ${{ secrets.TSS_PLATFORM_PASSWORD }}
+      TSS_PLATFORM_URL: ${{ secrets.TSS_PLATFORM_URL }}
+      TSS_PLATFORM_ALLOWED_VAULT_HOSTS: ${{ secrets.TSS_PLATFORM_ALLOWED_VAULT_HOSTS }}
+      TSS_PLATFORM_SECRET_ID: ${{ secrets.TSS_PLATFORM_SECRET_ID }}
+      TSS_PLATFORM_SECRET_PATH: ${{ secrets.TSS_PLATFORM_SECRET_PATH }}
+      TSS_PLATFORM_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_TEMPLATE_ID }}
+      TSS_PLATFORM_FOLDER_ID: ${{ secrets.TSS_PLATFORM_FOLDER_ID }}
+      TSS_PLATFORM_SITE_ID: ${{ secrets.TSS_PLATFORM_SITE_ID }}
+      TSS_PLATFORM_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_SSH_KEY_TEMPLATE_ID }}
+      TSS_PLATFORM_TEST_PASSWORD: ${{ secrets.TSS_PLATFORM_TEST_PASSWORD }}
+      TSS_PLATFORM_SEARCH_FIELD: ${{ secrets.TSS_PLATFORM_SEARCH_FIELD }}
+      TSS_PLATFORM_SEARCH_TEXT: ${{ secrets.TSS_PLATFORM_SEARCH_TEXT }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.26.6'
+          check-latest: true
+      - run: go mod download
+      - run: go mod verify
+      - run: go test -race -v ./server
+
+  tag:
+    name: Create verified release tag
+    needs: [verify, integration]
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: write
     steps:
-      - name: Set up Go 1.13
-        uses: actions/setup-go@6edd4406fa81c3da01a34fa6f6343087c207a568 # v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          go-version: 1.13
-        id: go
-
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
-
-      - name: Get dependencies
+          fetch-depth: 0
+      - name: Create the release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          go get -v -t -d ./...
-      - name: Build
-        run: go build -v .
-
-      - uses: actions/upload-artifact@v4 # v4
-        with:
-          name: artifacts
-          path: tss-sdk-go.exe
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG"; then
+            echo "refusing to replace existing tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git tag -a "$RELEASE_TAG" -m "Release $RELEASE_TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$RELEASE_TAG"

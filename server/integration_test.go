@@ -85,14 +85,25 @@ func (target integrationTarget) server(t *testing.T) *Server {
 func runBattery(t *testing.T, body func(*testing.T, *Server)) {
 	for _, target := range integrationTargets() {
 		t.Run(target.name, func(t *testing.T) {
+			if !target.required() {
+				t.Skipf("%s integration requires %s=1 or %s=1", target.name, integrationOptIn, target.requireVar)
+			}
 			if !target.configured() {
-				if target.required() {
-					t.Fatalf("%s integration is required but not configured", target.name)
-				}
-				t.Skipf("%s integration is not configured", target.name)
+				t.Fatalf("%s integration is required but not configured", target.name)
 			}
 			body(t, target.server(t))
 		})
+	}
+}
+
+func TestRunBatteryRequiresExplicitOptIn(t *testing.T) {
+	t.Setenv(integrationOptIn, "")
+	t.Setenv("TSS_REQUIRE_SECRET_SERVER", "")
+	t.Setenv("TSS_REQUIRE_PLATFORM", "")
+	called := false
+	runBattery(t, func(*testing.T, *Server) { called = true })
+	if called {
+		t.Fatal("ambient integration configuration ran a live test without explicit opt-in")
 	}
 }
 

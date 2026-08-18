@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"math"
 	"mime/multipart"
@@ -17,12 +16,14 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
-	delinea "github.com/DelineaXPM/delinea-tools/api"
+	delinea "github.com/DelineaXPM/delinea-common/api"
 )
 
 const (
@@ -30,7 +31,10 @@ const (
 	defaultTLD              = "com"
 	defaultHTTPTimeout      = 60 * time.Second
 	defaultMaxResponseBytes = 100 << 20
+	defaultMaxRequestBytes  = 100 << 20
 	defaultMaxAttachments   = 100
+	defaultMaxSearchResults = 1000
+	searchPageSize          = 30
 )
 
 // Logger is an interface for logging in the SDK. It matches the standard log package interface.
@@ -47,12 +51,6 @@ type DiscardLogger struct{}
 func (*DiscardLogger) Printf(string, ...interface{}) {}
 func (*DiscardLogger) Print(...interface{})          {}
 func (*DiscardLogger) Println(...interface{})        {}
-
-type stdLogger struct{}
-
-func (*stdLogger) Printf(format string, v ...interface{}) { log.Printf(format, v...) }
-func (*stdLogger) Print(v ...interface{})                 { log.Print(v...) }
-func (*stdLogger) Println(v ...interface{})               { log.Println(v...) }
 
 var defaultLoggerInstance Logger = &DiscardLogger{}
 
@@ -108,7 +106,9 @@ type Configuration struct {
 	// published Configuration and Server types comparable.
 	AllowedVaultHosts      string
 	MaxResponseBytes       int64
+	MaxRequestBytes        int64
 	MaxAttachmentDownloads int
+	MaxSearchResults       int
 
 	runtime *serverRuntime
 }
@@ -119,8 +119,10 @@ type Server struct {
 	Configuration
 }
 
-// TokenCache is retained for v3 source and wire compatibility. Token storage is
-// implemented by delinea-tools and no longer uses this type internally.
+// TokenCache is retained for v3 source and wire compatibility.
+//
+// Deprecated: token storage is implemented by delinea-common and no longer uses
+// this type internally. It is a v4 deletion candidate.
 type TokenCache struct {
 	AccessToken string `json:"access_token"`
 	ExpiresIn   int    `json:"expires_in"`
@@ -140,8 +142,10 @@ type serverRuntime struct {
 	config         delinea.Config
 	logger         Logger
 	responseLimit  int64
+	requestLimit   int64
 	timeout        time.Duration
 	maxAttachments int
+	maxSearch      int
 }
 
 type operationBudget struct {
@@ -191,8 +195,14 @@ func New(config Configuration) (*Server, error) {
 	if config.MaxResponseBytes < 0 {
 		return nil, fmt.Errorf("max response bytes must not be negative")
 	}
+	if config.MaxRequestBytes < 0 {
+		return nil, fmt.Errorf("max request bytes must not be negative")
+	}
 	if config.MaxAttachmentDownloads < 0 {
 		return nil, fmt.Errorf("max attachment downloads must not be negative")
+	}
+	if config.MaxSearchResults < 0 {
+		return nil, fmt.Errorf("max search results must not be negative")
 	}
 	if config.TLSClientConfig != nil && config.CACertPEM != "" {
 		return nil, fmt.Errorf("TLSClientConfig and CACertPEM cannot both be set")
@@ -250,9 +260,9 @@ func New(config Configuration) (*Server, error) {
 			return nil, fmt.Errorf("TLSClientConfig requires an *http.Transport, got %T", http.DefaultTransport)
 		}
 		clone := transport.Clone()
-		clone.TLSClientConfig = config.TLSClientConfig.Clone()
+		clone.TLSClientConfig = snapshotTLSConfig(config.TLSClientConfig)
 		apiConfig.Transport = clone
-		config.TLSClientConfig = config.TLSClientConfig.Clone()
+		config.TLSClientConfig = snapshotTLSConfig(config.TLSClientConfig)
 	}
 	logger := config.Logger
 	if logger == nil {
@@ -264,15 +274,72 @@ func New(config Configuration) (*Server, error) {
 	} else if responseLimit == math.MaxInt64 {
 		responseLimit--
 	}
+	requestLimit := config.MaxRequestBytes
+	if requestLimit <= 0 {
+		requestLimit = defaultMaxRequestBytes
+	}
 	maxAttachments := config.MaxAttachmentDownloads
 	if maxAttachments == 0 {
 		maxAttachments = defaultMaxAttachments
 	}
+	maxSearch := config.MaxSearchResults
+	if maxSearch == 0 {
+		maxSearch = defaultMaxSearchResults
+	}
 	config.runtime = &serverRuntime{
-		config: apiConfig, logger: logger, responseLimit: responseLimit,
-		timeout: apiConfig.Timeout, maxAttachments: maxAttachments,
+		config: apiConfig, logger: logger, responseLimit: responseLimit, requestLimit: requestLimit,
+		timeout: apiConfig.Timeout, maxAttachments: maxAttachments, maxSearch: maxSearch,
 	}
 	return &Server{Configuration: config}, nil
+}
+
+// snapshotTLSConfig copies the mutable standard-library-owned portions of a
+// tls.Config. Interface and callback fields remain shared by necessity; callers
+// supplying those fields must keep their implementations safe for concurrent use.
+func snapshotTLSConfig(source *tls.Config) *tls.Config {
+	clone := source.Clone()
+	if source.RootCAs != nil {
+		clone.RootCAs = source.RootCAs.Clone()
+	}
+	if source.ClientCAs != nil {
+		clone.ClientCAs = source.ClientCAs.Clone()
+	}
+	clone.NextProtos = slices.Clone(source.NextProtos)
+	clone.CipherSuites = slices.Clone(source.CipherSuites)
+	clone.CurvePreferences = slices.Clone(source.CurvePreferences)
+	clone.EncryptedClientHelloConfigList = bytes.Clone(source.EncryptedClientHelloConfigList)
+	clone.Certificates = make([]tls.Certificate, len(source.Certificates))
+	for i, certificate := range source.Certificates {
+		clone.Certificates[i] = certificate
+		clone.Certificates[i].Certificate = cloneByteSlices(certificate.Certificate)
+		clone.Certificates[i].SupportedSignatureAlgorithms = slices.Clone(certificate.SupportedSignatureAlgorithms)
+		clone.Certificates[i].OCSPStaple = bytes.Clone(certificate.OCSPStaple)
+		clone.Certificates[i].SignedCertificateTimestamps = cloneByteSlices(certificate.SignedCertificateTimestamps)
+		if certificate.Leaf != nil && len(clone.Certificates[i].Certificate) > 0 {
+			// Parse from the copied DER instead of retaining the caller's mutable
+			// parsed-certificate pointer. A nil Leaf lets crypto/tls parse lazily.
+			clone.Certificates[i].Leaf, _ = x509.ParseCertificate(clone.Certificates[i].Certificate[0])
+		}
+	}
+	clone.EncryptedClientHelloKeys = make([]tls.EncryptedClientHelloKey, len(source.EncryptedClientHelloKeys))
+	for i, key := range source.EncryptedClientHelloKeys {
+		clone.EncryptedClientHelloKeys[i] = key
+		clone.EncryptedClientHelloKeys[i].Config = bytes.Clone(key.Config)
+		clone.EncryptedClientHelloKeys[i].PrivateKey = bytes.Clone(key.PrivateKey)
+	}
+	// NameToCertificate is deprecated server-only state and must not retain
+	// pointers into the caller's certificate slice on this client transport.
+	//lint:ignore SA1019 clearing deprecated state is the compatibility-safe snapshot
+	clone.NameToCertificate = nil
+	return clone
+}
+
+func cloneByteSlices(values [][]byte) [][]byte {
+	clone := make([][]byte, len(values))
+	for i, value := range values {
+		clone[i] = bytes.Clone(value)
+	}
+	return clone
 }
 
 func parseAllowedVaultHosts(value string) []string {
@@ -408,17 +475,35 @@ func (s Server) accessResourceContextWithBudget(ctx context.Context, method, res
 	}
 	var body io.Reader
 	if input != nil {
+		if secret, ok := input.(Secret); ok {
+			size, err := secretJSONSize(secret, s.maxRequestBytes())
+			if err != nil {
+				return nil, err
+			}
+			if size > s.maxRequestBytes() {
+				return nil, fmt.Errorf("request body exceeded %d bytes", s.maxRequestBytes())
+			}
+		}
 		data, err := json.Marshal(input)
 		if err != nil {
 			return nil, err
 		}
+		if int64(len(data)) > s.maxRequestBytes() {
+			return nil, fmt.Errorf("request body exceeded %d bytes", s.maxRequestBytes())
+		}
 		body = bytes.NewReader(data)
 	}
-	withholdDiagnostic := input != nil || strings.Contains(path, "?")
-	return s.doWithBudget(ctx, delinea.Request{Method: method, Path: s.requestPath(resource, path), Body: body}, budget, withholdDiagnostic)
+	requestPath := s.requestPath(resource, path)
+	if int64(len(requestPath)) > s.maxRequestBytes() {
+		return nil, fmt.Errorf("request target exceeded %d bytes", s.maxRequestBytes())
+	}
+	withholdDiagnostic := resource == "secrets" ||
+		(resource == "secret-templates" && strings.HasPrefix(path, "generate-password/")) ||
+		input != nil || strings.Contains(path, "?")
+	return s.doWithBudget(ctx, delinea.Request{Method: method, Path: requestPath, Body: body}, budget, withholdDiagnostic)
 }
 
-func (s Server) searchResourcesContextWithBudget(ctx context.Context, resource, searchText, field string, budget *operationBudget) ([]byte, error) {
+func (s Server) searchResourcesContextWithBudget(ctx context.Context, resource, searchText, field string, skip, take int, budget *operationBudget) ([]byte, error) {
 	if resource != "secrets" {
 		return nil, fmt.Errorf("unknown resource")
 	}
@@ -426,8 +511,8 @@ func (s Server) searchResourcesContextWithBudget(ctx context.Context, resource, 
 	query.Set("paging.filter.searchText", searchText)
 	query.Set("paging.filter.searchField", field)
 	query.Set("paging.filter.doNotCalculateTotal", "true")
-	query.Set("paging.take", "30")
-	query.Set("paging.skip", "0")
+	query.Set("paging.take", strconv.Itoa(take))
+	query.Set("paging.skip", strconv.Itoa(skip))
 	if field == "" {
 		for _, name := range []string{"Machine", "Notes", "Username"} {
 			query.Add("paging.filter.extendedFields", name)
@@ -435,7 +520,11 @@ func (s Server) searchResourcesContextWithBudget(ctx context.Context, resource, 
 	} else {
 		query.Set("paging.filter.isExactMatch", "true")
 	}
-	path := strings.TrimSuffix(s.requestPath(resource, ""), "/") + "?" + query.Encode()
+	base := strings.TrimSuffix(s.requestPath(resource, ""), "/")
+	if requestTargetLength(base, query) > s.maxRequestBytes() {
+		return nil, fmt.Errorf("request target exceeded %d bytes", s.maxRequestBytes())
+	}
+	path := base + "?" + query.Encode()
 	return s.doWithBudget(ctx, delinea.Request{Method: http.MethodGet, Path: path}, budget, true)
 }
 
@@ -460,25 +549,31 @@ func (s Server) doWithBudget(ctx context.Context, request delinea.Request, budge
 	return body, nil
 }
 
-func (s Server) uploadFile(secretID int, field SecretField) error {
-	ctx, cancel := s.operationContext()
-	defer cancel()
-	return s.uploadFileContext(ctx, secretID, field)
-}
-
-func (s Server) uploadFileContext(ctx context.Context, secretID int, field SecretField) error {
-	return s.uploadFileContextWithBudget(ctx, secretID, field, s.newOperationBudget())
-}
-
 func (s Server) uploadFileContextWithBudget(ctx context.Context, secretID int, field SecretField, budget *operationBudget) error {
-	body := new(bytes.Buffer)
-	writer := multipart.NewWriter(body)
+	path, err := s.pathWithEscapedSegment("secrets", fmt.Sprintf("%d/fields/", secretID), field.Slug)
+	if err != nil {
+		return err
+	}
 	filename := field.Filename
+	filenameSuffix := ""
 	if filename == "" {
 		filename = "File.txt"
 	} else if match, _ := regexp.MatchString(`[^.]+\.\w+$`, filename); !match {
-		filename += ".txt"
+		filenameSuffix = ".txt"
 	}
+	size, err := multipartBodySizeParts(filename, filenameSuffix, len(field.ItemValue))
+	if err != nil {
+		return err
+	}
+	if size > s.maxRequestBytes() {
+		return fmt.Errorf("request body exceeded %d bytes", s.maxRequestBytes())
+	}
+	// Append only after the preflight proves the resulting multipart request is
+	// within the configured bound. Otherwise an extensionless, caller-controlled
+	// filename could force a large duplicate allocation merely to reject it.
+	filename += filenameSuffix
+	body := new(bytes.Buffer)
+	writer := multipart.NewWriter(body)
 	part, err := writer.CreateFormFile("file", filename)
 	if err != nil {
 		return err
@@ -489,7 +584,9 @@ func (s Server) uploadFileContextWithBudget(ctx context.Context, secretID int, f
 	if err := writer.Close(); err != nil {
 		return err
 	}
-	path := fmt.Sprintf("%d/fields/%s", secretID, url.PathEscape(field.Slug))
+	if int64(body.Len()) > s.maxRequestBytes() {
+		return fmt.Errorf("request body exceeded %d bytes", s.maxRequestBytes())
+	}
 	_, err = s.doWithBudget(ctx, delinea.Request{
 		Method: http.MethodPut,
 		Path:   s.requestPath("secrets", path),
@@ -497,6 +594,197 @@ func (s Server) uploadFileContextWithBudget(ctx context.Context, secretID int, f
 		Body:   body,
 	}, budget, true)
 	return err
+}
+
+func (s Server) pathWithEscapedSegment(resource, prefix, segment string) (string, error) {
+	targetPrefix := s.requestPath(resource, prefix)
+	if joinedLength(int64(len(targetPrefix)), pathEscapedLength(segment)) > s.maxRequestBytes() {
+		return "", fmt.Errorf("request target exceeded %d bytes", s.maxRequestBytes())
+	}
+	return prefix + url.PathEscape(segment), nil
+}
+
+func requestTargetLength(base string, query url.Values) int64 {
+	return joinedLength(int64(len(base)), 1, encodedQueryLength(query))
+}
+
+func encodedQueryLength(query url.Values) int64 {
+	var length int64
+	first := true
+	for key, values := range query {
+		for _, value := range values {
+			if !first {
+				length = joinedLength(length, 1)
+			}
+			first = false
+			length = joinedLength(length, queryEscapedLength(key), 1, queryEscapedLength(value))
+		}
+	}
+	return length
+}
+
+func queryEscapedLength(value string) int64 {
+	var length int64
+	for i := 0; i < len(value); i++ {
+		if isURLUnreserved(value[i]) || value[i] == ' ' {
+			length = joinedLength(length, 1)
+		} else {
+			length = joinedLength(length, 3)
+		}
+	}
+	return length
+}
+
+func pathEscapedLength(value string) int64 {
+	var length int64
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if isURLUnreserved(c) || strings.ContainsRune("$&+:=@", rune(c)) {
+			length = joinedLength(length, 1)
+		} else {
+			length = joinedLength(length, 3)
+		}
+	}
+	return length
+}
+
+func isURLUnreserved(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9' || strings.ContainsRune("-_.~", rune(c))
+}
+
+func joinedLength(parts ...int64) int64 {
+	var total int64
+	for _, part := range parts {
+		if part > math.MaxInt64-total {
+			return math.MaxInt64
+		}
+		total += part
+	}
+	return total
+}
+
+func secretJSONSize(secret Secret, limit int64) (int64, error) {
+	// Marshal a payload-shaped value with its strings cleared, then add their
+	// exact escaped lengths. This bounds allocation before encoding user data.
+	if int64(len(secret.Fields)) > limit/128 {
+		if limit == math.MaxInt64 {
+			return math.MaxInt64, nil
+		}
+		return limit + 1, nil
+	}
+	shape := secret
+	shape.Name = ""
+	shape.Fields = slices.Clone(secret.Fields)
+	for i := range shape.Fields {
+		shape.Fields[i].FieldName = ""
+		shape.Fields[i].Slug = ""
+		shape.Fields[i].FieldDescription = ""
+		shape.Fields[i].Filename = ""
+		shape.Fields[i].ItemValue = ""
+	}
+	base, err := json.Marshal(shape)
+	if err != nil {
+		return 0, err
+	}
+	size := int64(len(base))
+	addString := func(value string) bool {
+		additional := jsonStringLength(value) - 2 // shape already contains ""
+		if additional > math.MaxInt64-size {
+			size = math.MaxInt64
+			return false
+		}
+		size += additional
+		return size <= limit
+	}
+	if !addString(secret.Name) {
+		return size, nil
+	}
+	for _, field := range secret.Fields {
+		for _, value := range []string{field.FieldName, field.Slug, field.FieldDescription, field.Filename, field.ItemValue} {
+			if !addString(value) {
+				return size, nil
+			}
+		}
+	}
+	return size, nil
+}
+
+func jsonStringLength(value string) int64 {
+	length := int64(2) // surrounding quotes
+	for i := 0; i < len(value); {
+		c := value[i]
+		if c < utf8.RuneSelf {
+			i++
+			switch c {
+			case '\\', '"', '\b', '\f', '\n', '\r', '\t':
+				length += 2
+			case '<', '>', '&':
+				length += 6
+			default:
+				if c < 0x20 {
+					length += 6
+				} else {
+					length++
+				}
+			}
+			continue
+		}
+		r, width := utf8.DecodeRuneInString(value[i:])
+		i += width
+		if r == utf8.RuneError && width == 1 || r == '\u2028' || r == '\u2029' {
+			length += 6
+		} else {
+			length += int64(width)
+		}
+	}
+	return length
+}
+
+type byteCounter int64
+
+func (c *byteCounter) Write(p []byte) (int, error) {
+	*c += byteCounter(len(p))
+	return len(p), nil
+}
+
+func multipartBodySize(filename string, contentLength int) (int64, error) {
+	return multipartBodySizeParts(filename, "", contentLength)
+}
+
+func multipartBodySizeParts(filename, suffix string, contentLength int) (int64, error) {
+	var count byteCounter
+	writer := multipart.NewWriter(&count)
+	if _, err := writer.CreateFormFile("file", ""); err != nil {
+		return 0, err
+	}
+	if err := writer.Close(); err != nil {
+		return 0, err
+	}
+	variable := joinedLength(multipartFilenameLength(filename), multipartFilenameLength(suffix))
+	if variable > math.MaxInt64-int64(count) {
+		return math.MaxInt64, nil
+	}
+	count += byteCounter(variable)
+	if int64(contentLength) > math.MaxInt64-int64(count) {
+		return math.MaxInt64, nil
+	}
+	return int64(count) + int64(contentLength), nil
+}
+
+func multipartFilenameLength(filename string) int64 {
+	var length int64
+	for i := 0; i < len(filename); i++ {
+		switch filename[i] {
+		case '\r', '\n':
+			length += 3 // %0D or %0A
+		case '\\', '"':
+			length += 2
+		default:
+			length++
+		}
+	}
+	return length
 }
 
 func (s Server) maxResponseBytes() int64 {
@@ -507,6 +795,26 @@ func (s Server) maxResponseBytes() int64 {
 		return min(s.MaxResponseBytes, int64(math.MaxInt64-1))
 	}
 	return defaultMaxResponseBytes
+}
+
+func (s Server) maxRequestBytes() int64 {
+	if s.runtime != nil {
+		return s.runtime.requestLimit
+	}
+	if s.MaxRequestBytes > 0 {
+		return s.MaxRequestBytes
+	}
+	return defaultMaxRequestBytes
+}
+
+func (s Server) maxSearchResults() int {
+	if s.runtime != nil {
+		return s.runtime.maxSearch
+	}
+	if s.MaxSearchResults > 0 {
+		return s.MaxSearchResults
+	}
+	return defaultMaxSearchResults
 }
 
 type legacyLogHandler struct {
@@ -541,11 +849,15 @@ func (h *legacyLogHandler) Handle(_ context.Context, record slog.Record) error {
 
 func sanitizeLogText(value string) string {
 	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+		if unsafeRecordRune(r) {
 			return '?'
 		}
 		return r
 	}, value)
+}
+
+func unsafeRecordRune(r rune) bool {
+	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029'
 }
 
 func (h *legacyLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
@@ -560,7 +872,10 @@ func (h *legacyLogHandler) WithGroup(name string) slog.Handler {
 	return &clone
 }
 
-// Deprecated wire types retained for v3 compatibility.
+// Response is the former health-check wire model.
+//
+// Deprecated: retained only for v3 source compatibility. The delinea-common
+// engine owns health checking. This type is a v4 deletion candidate.
 type Response struct {
 	Healthy               bool `json:"healthy"`
 	DatabaseHealthy       bool `json:"databaseHealthy"`
@@ -569,6 +884,10 @@ type Response struct {
 	ScheduledForDeletion  bool `json:"scheduledForDeletion"`
 }
 
+// OAuthTokens is the former authentication response model.
+//
+// Deprecated: retained only for v3 source compatibility. The delinea-common
+// engine owns authentication. This type is a v4 deletion candidate.
 type OAuthTokens struct {
 	AccessToken      string `json:"access_token"`
 	RefreshToken     string `json:"refresh_token"`
@@ -579,11 +898,19 @@ type OAuthTokens struct {
 	Scope            string `json:"scope"`
 }
 
+// Connection is the former Platform vault connection wire model.
+//
+// Deprecated: retained only for v3 source compatibility. The delinea-common
+// engine owns vault discovery. This type is a v4 deletion candidate.
 type Connection struct {
 	Url            string `json:"url"`
 	OAuthProfileId string `json:"oAuthProfileId"`
 }
 
+// Vault is the former Platform vault wire model.
+//
+// Deprecated: retained only for v3 source compatibility. The delinea-common
+// engine owns vault discovery. This type is a v4 deletion candidate.
 type Vault struct {
 	VaultId         string     `json:"vaultId"`
 	Name            string     `json:"name"`
@@ -594,6 +921,10 @@ type Vault struct {
 	Connection      Connection `json:"connection"`
 }
 
+// VaultsResponseModel is the former Platform vault-list wire model.
+//
+// Deprecated: retained only for v3 source compatibility. The delinea-common
+// engine owns vault discovery. This type is a v4 deletion candidate.
 type VaultsResponseModel struct {
 	Vaults []Vault `json:"vaults"`
 }
