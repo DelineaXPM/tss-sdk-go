@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"unicode"
+	"unicode/utf8"
 
-	delinea "github.com/DelineaXPM/delinea-tools/api"
+	delinea "github.com/DelineaXPM/delinea-common/api"
 )
 
 const errorBodyLength = 255
@@ -53,13 +53,17 @@ func handleBufferedResponse(response *delinea.BufferedResponse, limit int64, wit
 
 func truncateDiagnostic(value string, limit int) string {
 	value = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+		if unsafeRecordRune(r) {
 			return ' '
 		}
 		return r
 	}, value)
-	if len(value) >= limit {
-		return value[:limit] + "..."
+	if len(value) > limit {
+		end := limit
+		for end > 0 && !utf8.RuneStart(value[end]) {
+			end--
+		}
+		return value[:end] + "..."
 	}
 	return value
 }

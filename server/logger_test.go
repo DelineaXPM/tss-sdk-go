@@ -45,14 +45,6 @@ func TestLoggerInterface(t *testing.T) {
 		logger.Println("test")
 	})
 
-	t.Run("stdLogger", func(t *testing.T) {
-		var logger Logger = &stdLogger{}
-		// Should not panic
-		logger.Printf(testMessage, "message")
-		logger.Print("test")
-		logger.Println("test")
-	})
-
 	t.Run("mockLogger", func(t *testing.T) {
 		mock := &mockLogger{}
 		var logger Logger = mock

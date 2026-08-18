@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"regexp"
 	"testing"
 )
@@ -96,13 +97,13 @@ func SecretCRUD(t *testing.T, tss *Server) {
 	refSecret.Fields = fields
 
 	sc, err := tss.CreateSecret(*refSecret)
+	markDeleted := cleanupCreatedSecret(t, tss, sc, err)
 	if err != nil {
 		t.Fatal("calling server.CreateSecret:", err)
 	}
 	if sc == nil {
 		t.Fatal("created secret data is nil")
 	}
-	markDeleted := deleteAfterTest(t, tss, sc.ID)
 	if !validate("created secret folder id", folderId, sc.FolderID, t) {
 		return
 	}
@@ -272,13 +273,13 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 
 	// Test creation of a new secret
 	sc, err := tss.CreateSecret(*refSecret)
+	markDeleted := cleanupCreatedSecret(t, tss, sc, err)
 	if err != nil {
 		t.Fatal("calling server.CreateSecret:", err)
 	}
 	if sc == nil {
 		t.Fatal("created secret data is nil")
 	}
-	markDeleted := deleteAfterTest(t, tss, sc.ID)
 	if !validate("created secret name", "Test SSH Key Secret", sc.Name, t) {
 		return
 	}
@@ -641,6 +642,25 @@ func validateSensitive(label, expected, found string, t *testing.T) bool {
 		return false
 	}
 	return true
+}
+
+// cleanupCreatedSecret registers cleanup before a create error can stop the
+// test. A PartialWriteError means the server-side object may exist even though
+// CreateSecret did not complete all attachment or refresh steps.
+func cleanupCreatedSecret(t *testing.T, server *Server, secret *Secret, createErr error) func() {
+	t.Helper()
+	id := 0
+	if secret != nil {
+		id = secret.ID
+	}
+	var partial *PartialWriteError
+	if id == 0 && errors.As(createErr, &partial) {
+		id = partial.SecretID
+	}
+	if id > 0 {
+		return deleteAfterTest(t, server, id)
+	}
+	return func() {}
 }
 
 // getField returns the field with the given id, and whether looking it up went wrong.

@@ -7,7 +7,7 @@ A Golang API and examples for [Delinea](https://delinea.com/)
 
 The v3.1 client requires Go 1.26.6. Its authentication, token caching, TLS,
 retry, backend-probing, and Platform vault-routing engine is provided by
-`github.com/DelineaXPM/delinea-tools/api`; this module retains the established
+`github.com/DelineaXPM/delinea-common/api`; this module retains the established
 typed Secret Server models and operations.
 
 ## Configure
@@ -35,7 +35,9 @@ type Configuration struct {
     RetryBaseDelay    time.Duration
     AllowedVaultHosts string // comma-separated exact host or host:port values
     MaxResponseBytes  int64
+    MaxRequestBytes   int64
     MaxAttachmentDownloads int
+    MaxSearchResults  int
 }
 ```
 
@@ -53,7 +55,16 @@ servers remain usable without it. For private certificate authorities, prefer
 `CACertPEM` so identically configured `Server` instances can safely share token
 grants. `TLSClientConfig` remains available for advanced TLS customization but
 isolates each `Server` from cross-instance token sharing. The two TLS settings
-cannot be combined.
+cannot be combined. `New` copies certificate pools, certificate bytes, and other
+mutable standard TLS slices. Callback, private-key, cache, writer, and other
+interface-owned state cannot be cloned and must remain safe for concurrent use.
+
+Cloud `Tenant` values must be single DNS labels. `TLD` defaults to `com` and
+accepts the supported Delinea regions `com`, `eu`, `com.au`, `com.sg`,
+`ca`, `co.uk`, and `ae`. Other deployments must use their complete HTTPS
+origin in `ServerURL`. Base URLs cannot contain user information, a query, or a
+fragment. Supplied bearer tokens must be at least four bytes and cannot contain
+whitespace or control characters.
 
 `Timeout` is a total deadline for each context-free SDK operation and also a
 progress limit for response headers and stalled body reads. A `Context` method
@@ -62,7 +73,22 @@ after the first GET/HEAD or token-grant attempt; zero selects the engine default
 and `DisableRetries` selects one attempt. Mutating requests are never replayed.
 `MaxResponseBytes` limits the combined buffered response bodies for one SDK
 operation, including automatically downloaded attachments.
+`MaxRequestBytes` limits each buffered JSON or attachment request and defaults
+to 100 MiB. `MaxSearchResults` defaults to 1,000; searches paginate in batches
+of 30 and return an error instead of silently truncating results at that limit.
 `MaxAttachmentDownloads` limits those automatic downloads and defaults to 100.
+
+Create and update operations involving attachments use multiple server requests
+and are not atomic. If the initial write succeeds but an attachment operation or
+final refresh fails, the method returns the partial `*Secret` together with a
+`*server.PartialWriteError`. Use its `SecretID` to inspect or clean up the
+server-side object when it is positive; it is zero when a malformed create
+response did not provide a trustworthy identity. Do not blindly retry a create
+after this error.
+
+`UserCredential` deliberately emits redacted password and token values when
+marshaled to JSON. JSON output is safe for diagnostics but is not a persistence
+or round-trip format. JSON input containing real credentials remains supported.
 
 ## Use
 
@@ -109,8 +135,8 @@ if err != nil {
     log.Fatal("failure calling server.Secret", err)
 }
 
-if pw, ok := secret.Field("password"); ok {
-    fmt.Print("the password is", pw)
+if _, ok := s.Field("password"); !ok {
+    log.Fatal("secret has no password field")
 }
 ```
 
@@ -227,21 +253,24 @@ tss, err := server.New(server.Configuration{
 
 ## Test
 
-### Private dependency during facade development
+Live tenant tests are disabled unless `TSS_INTEGRATION=1` or the target-specific
+`TSS_REQUIRE_SECRET_SERVER=1` / `TSS_REQUIRE_PLATFORM=1` flag is set. This keeps
+an ordinary `go test ./...` from creating, updating, or deleting secrets merely
+because credentials happen to be present in the environment.
 
-Until `delinea-tools` is public at v1.0.0, this branch uses its private v0.1.0
-candidate without a `replace` directive. Local development requires GitHub read
-access and:
+The SDK pins the public immutable `delinea-common` v1.0.0 module without a
+`replace` directive or private-module authentication.
 
-```shell
-go env -w GOPRIVATE='github.com/DelineaXPM/*'
-go env -w GONOSUMDB='github.com/DelineaXPM/*'
-gh auth setup-git
-```
-
-CI temporarily requires a read-only `DELINEA_TOOLS_READ_TOKEN` repository
-secret. Before releasing tss-sdk-go, update `go.mod` to the public immutable
-`delinea-tools` v1.0.0 tag and remove this temporary authentication setup.
+Live tenant credentials belong only in a required-review `live-tests`
+environment restricted to `main`. The ordinary test workflow never runs its live
+job for pull requests, development-branch pushes, or tags. Repository
+administrators must also protect `main`, restrict direct creation and movement of
+`v*` tags to the release workflow, require review for the `release` environment,
+and disallow protection-rule bypass before enabling hosted live tests or releases.
+Releases are created by manually dispatching the release workflow from `main`;
+it verifies the public dependency, offline analysis, and complete live tenant
+battery before it creates the requested tag. Module replacements are forbidden
+for releases.
 
 The tests populate a `Configuration` from JSON:
 
@@ -266,7 +295,7 @@ if err != nil {
         "username": "my_app_user",
         "password": "Passw0rd."
     },
-    "serverURL": "http://example.local/SecretServer"
+    "serverURL": "https://example.local/SecretServer"
 }
 ```
 

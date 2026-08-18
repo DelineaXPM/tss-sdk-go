@@ -27,7 +27,8 @@ func main() {
 		log.Fatal("Error calling server.Secret", err)
 	}
 
-	if pw, ok := s.Field("password"); ok {
-		fmt.Print("the password is", pw)
+	if _, ok := s.Field("password"); !ok {
+		log.Fatal("Secret has no password field")
 	}
+	fmt.Println("Secret retrieved successfully")
 }
