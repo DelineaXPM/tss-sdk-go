@@ -2,27 +2,33 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"log/slog"
 	"math"
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
+
+	delinea "github.com/DelineaXPM/delinea-tools/api"
 )
 
 const (
-	cloudBaseURLTemplate string = "https://%s.secretservercloud.%s/"
-	defaultAPIPathURI    string = "/api/v1"
-	defaultTokenPathURI  string = "/oauth2/token"
-	defaultTLD           string = "com"
+	defaultAPIPathURI       = "/api/v1"
+	defaultTokenPathURI     = "/oauth2/token"
+	defaultTLD              = "com"
+	defaultHTTPTimeout      = 60 * time.Second
+	defaultMaxResponseBytes = 100 << 20
 )
 
 // Logger is an interface for logging in the SDK. It matches the standard log package interface.
@@ -34,75 +40,124 @@ type Logger interface {
 }
 
 // DiscardLogger is a Logger implementation that discards all output (no-op).
-// Use this to completely disable logging from the SDK.
 type DiscardLogger struct{}
 
-func (d *DiscardLogger) Printf(format string, v ...interface{}) {
-	// Intentionally empty - DiscardLogger is a no-op implementation
-}
+func (*DiscardLogger) Printf(string, ...interface{}) {}
+func (*DiscardLogger) Print(...interface{})          {}
+func (*DiscardLogger) Println(...interface{})        {}
 
-func (d *DiscardLogger) Print(v ...interface{}) {
-	// Intentionally empty - DiscardLogger is a no-op implementation
-}
-
-func (d *DiscardLogger) Println(v ...interface{}) {
-	// Intentionally empty - DiscardLogger is a no-op implementation
-}
-
-// stdLogger wraps the standard log package and implements the Logger interface
 type stdLogger struct{}
 
-func (s *stdLogger) Printf(format string, v ...interface{}) {
-	log.Printf(format, v...)
-}
+func (*stdLogger) Printf(format string, v ...interface{}) { log.Printf(format, v...) }
+func (*stdLogger) Print(v ...interface{})                 { log.Print(v...) }
+func (*stdLogger) Println(v ...interface{})               { log.Println(v...) }
 
-func (s *stdLogger) Print(v ...interface{}) {
-	log.Print(v...)
-}
-
-func (s *stdLogger) Println(v ...interface{}) {
-	log.Println(v...)
-}
-
-// defaultLoggerInstance is the default logger used when no Logger is configured.
-// Following Go library conventions, logging is disabled by default.
-// To enable logging, set Configuration.Logger to log.Default() or a custom logger.
 var defaultLoggerInstance Logger = &DiscardLogger{}
 
 // UserCredential holds the username and password that the API should use to
-// authenticate to the REST API
+// authenticate to the REST API.
 type UserCredential struct {
 	Domain, Username, Password, Token string
 }
 
-// Configuration settings for the API
+func (c UserCredential) String() string {
+	return fmt.Sprintf("{Domain:%s Username:%s Password:%s Token:%s}",
+		c.Domain, c.Username, redactSecret(c.Password), redactSecret(c.Token))
+}
+
+func (c UserCredential) GoString() string {
+	return fmt.Sprintf("server.UserCredential{Domain:%q, Username:%q, Password:%q, Token:%q}",
+		c.Domain, c.Username, redactSecret(c.Password), redactSecret(c.Token))
+}
+
+func (c UserCredential) MarshalJSON() ([]byte, error) {
+	type redactedCredential struct{ Domain, Username, Password, Token string }
+	return json.Marshal(redactedCredential{
+		Domain: c.Domain, Username: c.Username,
+		Password: redactSecret(c.Password), Token: redactSecret(c.Token),
+	})
+}
+
+func redactSecret(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "<redacted>"
+}
+
+// Configuration settings for the API. Configuration is snapshotted by New;
+// mutating it through the returned Server does not reconfigure the live client.
 type Configuration struct {
 	Credentials                                      UserCredential
 	ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
-	TLSClientConfig                                  *tls.Config
-	Logger                                           Logger
+	TLSClientConfig                                  *tls.Config `json:"-"`
+	Logger                                           Logger      `json:"-"`
+	Timeout                                          time.Duration
+	MaxRetries                                       int
+	DisableRetries                                   bool
+	RetryBaseDelay                                   time.Duration
+	// AllowedVaultHosts is a comma-separated list of exact host or host:port
+	// values trusted for Platform-discovered vault URLs. A string keeps the
+	// published Configuration and Server types comparable.
+	AllowedVaultHosts string
+	MaxResponseBytes  int64
+
+	runtime *serverRuntime
 }
 
-// Server provides access to secrets stored in Delinea Secret Server
+// Server provides access to secrets stored in Delinea Secret Server.
+// Its public layout remains the v3.0.2 layout; runtime state is carried in the
+// private portion of the embedded Configuration.
 type Server struct {
 	Configuration
 }
 
+// TokenCache is retained for v3 source and wire compatibility. Token storage is
+// implemented by delinea-tools and no longer uses this type internally.
 type TokenCache struct {
 	AccessToken string `json:"access_token"`
 	ExpiresIn   int    `json:"expires_in"`
 }
 
-// New returns an initialized Secrets object
+type clientInitialization struct {
+	done        chan struct{}
+	client      *delinea.Client
+	err         error
+	leaderLocal bool
+}
+
+type serverRuntime struct {
+	mu            sync.Mutex
+	client        *delinea.Client
+	starting      *clientInitialization
+	config        delinea.Config
+	logger        Logger
+	responseLimit int64
+}
+
+// New validates and snapshots config without performing network I/O. Backend
+// probing, authentication, and vault discovery happen lazily on the first call.
 func New(config Configuration) (*Server, error) {
-	if config.ServerURL == "" && config.Tenant == "" || config.ServerURL != "" && config.Tenant != "" {
+	if (config.ServerURL == "") == (config.Tenant == "") {
 		return nil, fmt.Errorf("either ServerURL of Secret Server/Platform or Tenant of Secret Server Cloud must be set")
 	}
 	if config.TLD == "" {
 		config.TLD = defaultTLD
 	}
-	if config.TLSClientConfig != nil {
-		http.DefaultTransport.(*http.Transport).TLSClientConfig = config.TLSClientConfig
+	if config.MaxRetries < 0 {
+		return nil, fmt.Errorf("max retries must not be negative")
+	}
+	if config.MaxRetries == math.MaxInt {
+		return nil, fmt.Errorf("max retries is too large")
+	}
+	if config.RetryBaseDelay < 0 {
+		return nil, fmt.Errorf("retry base delay must not be negative")
+	}
+	if config.Timeout < 0 {
+		return nil, fmt.Errorf("timeout must not be negative")
+	}
+	if config.MaxResponseBytes < 0 {
+		return nil, fmt.Errorf("max response bytes must not be negative")
 	}
 	if config.apiPathURI == "" {
 		config.apiPathURI = defaultAPIPathURI
@@ -112,439 +167,307 @@ func New(config Configuration) (*Server, error) {
 		config.tokenPathURI = defaultTokenPathURI
 	}
 	config.tokenPathURI = strings.Trim(config.tokenPathURI, "/")
-	return &Server{config}, nil
+
+	baseURL, err := configuredURL(config)
+	if err != nil {
+		return nil, err
+	}
+	apiConfig := delinea.Config{
+		URL:               baseURL,
+		AllowInsecureHTTP: true, // v3.0.2 accepted explicit plaintext ServerURL values.
+		Username:          config.Credentials.Username,
+		Password:          config.Credentials.Password,
+		Domain:            config.Credentials.Domain,
+		Timeout:           config.Timeout,
+		AllowedVaultHosts: parseAllowedVaultHosts(config.AllowedVaultHosts),
+		Logger:            slogFor(config.Logger),
+	}
+	if apiConfig.Timeout == 0 {
+		apiConfig.Timeout = defaultHTTPTimeout
+	}
+	if config.Credentials.Token != "" {
+		apiConfig.Token = config.Credentials.Token
+		apiConfig.Target = delinea.TargetSecretServer
+	}
+	if config.DisableRetries {
+		apiConfig.Retries = 1
+	} else if config.MaxRetries > 0 {
+		apiConfig.Retries = config.MaxRetries + 1
+	}
+	if config.RetryBaseDelay > 0 {
+		base := config.RetryBaseDelay
+		apiConfig.Backoff = func(attempt int) time.Duration {
+			factor := time.Duration(1 << min(attempt, 20))
+			if base > time.Duration(math.MaxInt64)/factor {
+				return time.Duration(math.MaxInt64)
+			}
+			return base * factor
+		}
+	}
+	if config.TLSClientConfig != nil {
+		transport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("TLSClientConfig requires an *http.Transport, got %T", http.DefaultTransport)
+		}
+		clone := transport.Clone()
+		clone.TLSClientConfig = config.TLSClientConfig.Clone()
+		apiConfig.Transport = clone
+		config.TLSClientConfig = config.TLSClientConfig.Clone()
+	}
+	logger := config.Logger
+	if logger == nil {
+		logger = defaultLoggerInstance
+	}
+	responseLimit := config.MaxResponseBytes
+	if responseLimit <= 0 {
+		responseLimit = defaultMaxResponseBytes
+	} else if responseLimit == math.MaxInt64 {
+		responseLimit--
+	}
+	config.runtime = &serverRuntime{
+		config: apiConfig, logger: logger, responseLimit: responseLimit,
+	}
+	return &Server{Configuration: config}, nil
 }
 
-// log returns the logger to use for this Server. If no Logger is configured,
-// it returns the default logger that uses the standard log package.
-func (s *Server) log() Logger {
+func parseAllowedVaultHosts(value string) []string {
+	var hosts []string
+	for _, host := range strings.Split(value, ",") {
+		if host = strings.TrimSpace(host); host != "" {
+			hosts = append(hosts, host)
+		}
+	}
+	return hosts
+}
+
+func configuredURL(config Configuration) (string, error) {
+	if config.Tenant != "" {
+		return delinea.CloudURL(config.Tenant, config.TLD)
+	}
+	return delinea.NormalizeURL(config.ServerURL, true)
+}
+
+func (s Server) log() Logger {
+	if s.runtime != nil {
+		return s.runtime.logger
+	}
 	if s.Logger != nil {
 		return s.Logger
 	}
 	return defaultLoggerInstance
 }
 
-// urlFor is the URL for the given resource and path
-func (s Server) urlFor(resource, path string) string {
-	var baseURL string
-
-	if s.ServerURL == "" {
-		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
-	} else {
-		baseURL = s.ServerURL
+func (s Server) apiClient(ctx context.Context) (*delinea.Client, error) {
+	if s.runtime == nil {
+		return nil, fmt.Errorf("server was not initialized by New")
 	}
-
-	switch {
-	case resource == "token":
-		return fmt.Sprintf("%s/%s",
-			strings.Trim(baseURL, "/"),
-			strings.Trim(s.tokenPathURI, "/"))
-	default:
-		return fmt.Sprintf("%s/%s/%s/%s",
-			strings.Trim(baseURL, "/"),
-			strings.Trim(s.apiPathURI, "/"),
-			strings.Trim(resource, "/"),
-			strings.Trim(path, "/"))
-	}
-}
-
-func (s Server) urlForSearch(resource, searchText, fieldName string) string {
-	var baseURL string
-
-	if s.ServerURL == "" {
-		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
-	} else {
-		baseURL = s.ServerURL
-	}
-	switch {
-	case resource == "secrets":
-		url := fmt.Sprintf("%s/%s/%s?paging.filter.searchText=%s&paging.filter.searchField=%s&paging.filter.doNotCalculateTotal=true&paging.take=30&&paging.skip=0",
-			strings.Trim(baseURL, "/"),
-			strings.Trim(s.apiPathURI, "/"),
-			strings.Trim(resource, "/"),
-			searchText,
-			fieldName)
-		if fieldName == "" {
-			return fmt.Sprintf("%s%s", url, "&paging.filter.extendedFields=Machine&paging.filter.extendedFields=Notes&paging.filter.extendedFields=Username")
+	rt := s.runtime
+	for {
+		rt.mu.Lock()
+		if rt.client != nil {
+			client := rt.client
+			rt.mu.Unlock()
+			return client, nil
 		}
-		return fmt.Sprintf("%s%s", url, "&paging.filter.isExactMatch=true")
-	default:
-		return ""
+		if flight := rt.starting; flight != nil {
+			rt.mu.Unlock()
+			select {
+			case <-flight.done:
+				if flight.err != nil && flight.leaderLocal {
+					continue
+				}
+				return flight.client, flight.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		flight := &clientInitialization{done: make(chan struct{})}
+		rt.starting = flight
+		rt.mu.Unlock()
+		return rt.runInitialization(ctx, flight)
 	}
 }
 
-// accessResource uses the accessToken to access the API resource.
-// It assumes an appropriate combination of method, resource, path and input.
-func (s Server) accessResource(method, resource, path string, input interface{}) ([]byte, error) {
-	switch resource {
-	case "secrets":
-	case "secret-templates":
-	default:
-		message := "unknown resource"
-
-		s.log().Printf("[ERROR] %s: %s", message, resource)
-		return nil, fmt.Errorf(message)
+func (rt *serverRuntime) runInitialization(ctx context.Context, flight *clientInitialization) (client *delinea.Client, err error) {
+	completed := false
+	publish := func(client *delinea.Client, err error, leaderLocal bool) {
+		rt.mu.Lock()
+		flight.client, flight.err, flight.leaderLocal = client, err, leaderLocal
+		if err == nil {
+			rt.client = client
+		}
+		rt.starting = nil
+		close(flight.done)
+		rt.mu.Unlock()
+		completed = true
 	}
+	defer func() {
+		if !completed {
+			// Caller-supplied TLS callbacks and transports are arbitrary code. A
+			// panic must not strand every waiter behind an unclosed flight.
+			publish(nil, fmt.Errorf("API client initialization aborted"), true)
+		}
+	}()
+	client, err = initializeAPIClient(ctx, rt.config)
+	publish(client, err, ctx.Err() != nil && errors.Is(err, ctx.Err()))
+	return client, err
+}
 
-	body := bytes.NewBuffer([]byte{})
+func initializeAPIClient(ctx context.Context, config delinea.Config) (*delinea.Client, error) {
+	resolved, err := config.WithProbedTarget(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return delinea.New(resolved)
+}
 
+func (s Server) requestPath(resource, path string) string {
+	base := "/" + strings.Trim(s.apiPathURI, "/") + "/" + strings.Trim(resource, "/")
+	if path == "" {
+		return base + "/"
+	}
+	if path == "/" {
+		return base + "/"
+	}
+	return base + "/" + strings.TrimPrefix(path, "/")
+}
+
+func (s Server) accessResourceContext(ctx context.Context, method, resource, path string, input interface{}) ([]byte, error) {
+	if resource != "secrets" && resource != "secret-templates" {
+		return nil, fmt.Errorf("unknown resource")
+	}
+	var body io.Reader
 	if input != nil {
-		if data, err := json.Marshal(input); err == nil {
-			body = bytes.NewBuffer(data)
-		} else {
-			s.log().Print("[ERROR] marshaling the request body to JSON:", err)
+		data, err := json.Marshal(input)
+		if err != nil {
 			return nil, err
 		}
+		body = bytes.NewReader(data)
 	}
-
-	accessToken, err := s.getAccessToken()
-
-	if err != nil {
-		s.log().Print("[ERROR] error getting accessToken:", err)
-		return nil, err
-	}
-
-	req, err := http.NewRequest(method, s.urlFor(resource, path), body)
-
-	if err != nil {
-		s.log().Printf("[ERROR] creating req: %s /%s/%s: %s", method, resource, path, err)
-		return nil, err
-	}
-
-	req.Header.Add("Authorization", "Bearer "+accessToken)
-
-	switch method {
-	case "POST", "PUT", "PATCH":
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
-
-	data, statusCode, err := handleResponse((&http.Client{}).Do(req))
-
-	// Check for unauthorized or access denied
-	if statusCode.StatusCode == http.StatusUnauthorized || statusCode.StatusCode == http.StatusForbidden {
-		s.clearTokenCache()
-		s.log().Printf("[ERROR] Token cache cleared due to unauthorized or access denied response.")
-	}
-
-	return data, err
+	return s.do(ctx, delinea.Request{Method: method, Path: s.requestPath(resource, path), Body: body})
 }
 
-// searchResources uses the accessToken to search for API resources.
-// It assumes an appropriate combination of resource, search text.
-// field is optional
-func (s Server) searchResources(resource, searchText, field string) ([]byte, error) {
-	switch resource {
-	case "secrets":
-	default:
-		message := "unknown resource"
-
-		s.log().Printf("[ERROR] %s: %s", message, resource)
-		return nil, fmt.Errorf(message)
+func (s Server) searchResourcesContext(ctx context.Context, resource, searchText, field string) ([]byte, error) {
+	if resource != "secrets" {
+		return nil, fmt.Errorf("unknown resource")
 	}
-
-	method := "GET"
-	body := bytes.NewBuffer([]byte{})
-
-	accessToken, err := s.getAccessToken()
-
-	if err != nil {
-		s.log().Print("[ERROR] error getting accessToken:", err)
-		return nil, err
+	query := url.Values{}
+	query.Set("paging.filter.searchText", searchText)
+	query.Set("paging.filter.searchField", field)
+	query.Set("paging.filter.doNotCalculateTotal", "true")
+	query.Set("paging.take", "30")
+	query.Set("paging.skip", "0")
+	if field == "" {
+		for _, name := range []string{"Machine", "Notes", "Username"} {
+			query.Add("paging.filter.extendedFields", name)
+		}
+	} else {
+		query.Set("paging.filter.isExactMatch", "true")
 	}
-
-	req, err := http.NewRequest(method, s.urlForSearch(resource, searchText, field), body)
-
-	if err != nil {
-		s.log().Printf("[ERROR] creating req: %s /%s/%s/%s: %s", method, resource, searchText, field, err)
-		return nil, err
-	}
-
-	req.Header.Add("Authorization", "Bearer "+accessToken)
-
-	s.log().Printf("[DEBUG] calling %s %s", method, req.URL.String())
-
-	data, _, err := handleResponse((&http.Client{}).Do(req))
-
-	return data, err
+	path := strings.TrimSuffix(s.requestPath(resource, ""), "/") + "?" + query.Encode()
+	return s.do(ctx, delinea.Request{Method: http.MethodGet, Path: path})
 }
 
-// uploadFile uploads the file described in the given fileField to the
-// secret at the given secretId as a multipart/form-data request.
-func (s Server) uploadFile(secretId int, fileField SecretField) error {
-	s.log().Printf("[DEBUG] uploading a file to the '%s' field with filename '%s'", fileField.Slug, fileField.Filename)
-	body := bytes.NewBuffer([]byte{})
-	path := fmt.Sprintf("%d/fields/%s", secretId, fileField.Slug)
-
-	// Fetch the access token
-	accessToken, err := s.getAccessToken()
+func (s Server) do(ctx context.Context, request delinea.Request) ([]byte, error) {
+	client, err := s.apiClient(ctx)
 	if err != nil {
-		s.log().Print("[ERROR] error getting accessToken:", err)
-		return err
+		return nil, err
 	}
+	request.UseVault = client.Target() == delinea.TargetPlatform
+	limit := s.maxResponseBytes()
+	response, err := client.DoBufferedResponse(ctx, request, limit+1)
+	if err != nil {
+		return nil, err
+	}
+	return handleBufferedResponse(response, limit)
+}
 
-	// Create the multipart form
-	multipartWriter := multipart.NewWriter(body)
-	filename := fileField.Filename
+func (s Server) uploadFile(secretID int, field SecretField) error {
+	return s.uploadFileContext(context.Background(), secretID, field)
+}
+
+func (s Server) uploadFileContext(ctx context.Context, secretID int, field SecretField) error {
+	body := new(bytes.Buffer)
+	writer := multipart.NewWriter(body)
+	filename := field.Filename
 	if filename == "" {
 		filename = "File.txt"
-		s.log().Printf("[DEBUG] field has no filename, setting its filename to '%s'", filename)
-	} else if match, _ := regexp.Match("[^.]+\\.\\w+$", []byte(filename)); !match {
-		filename = filename + ".txt"
-		s.log().Printf("[DEBUG] field has no filename extension, setting its filename to '%s'", filename)
+	} else if match, _ := regexp.MatchString(`[^.]+\.\w+$`, filename); !match {
+		filename += ".txt"
 	}
-	form, err := multipartWriter.CreateFormFile("file", filename)
+	part, err := writer.CreateFormFile("file", filename)
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(form, strings.NewReader(fileField.ItemValue))
-	if err != nil {
+	if _, err := io.Copy(part, strings.NewReader(field.ItemValue)); err != nil {
 		return err
 	}
-	err = multipartWriter.Close()
-	if err != nil {
+	if err := writer.Close(); err != nil {
 		return err
 	}
-
-	// Make the request
-	req, err := http.NewRequest("PUT", s.urlFor(resource, path), body)
-	if err != nil {
-		return err
-	}
-	req.Header.Add("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
-	s.log().Printf("[DEBUG] uploading file with PUT %s", req.URL.String())
-	_, _, err = handleResponse((&http.Client{}).Do(req))
-
+	path := fmt.Sprintf("%d/fields/%s", secretID, url.PathEscape(field.Slug))
+	_, err = s.do(ctx, delinea.Request{
+		Method: http.MethodPut,
+		Path:   s.requestPath("secrets", path),
+		Header: http.Header{"Content-Type": {writer.FormDataContentType()}},
+		Body:   body,
+	})
 	return err
 }
 
-func (s *Server) setCacheAccessToken(value string, expiresIn int, baseURL string) error {
-	cache := TokenCache{}
-	cache.AccessToken = value
-	cache.ExpiresIn = (int(time.Now().Unix()) + expiresIn) - int(math.Floor(float64(expiresIn)*0.9))
+func (s Server) maxResponseBytes() int64 {
+	if s.runtime != nil {
+		return s.runtime.responseLimit
+	}
+	if s.MaxResponseBytes > 0 {
+		return min(s.MaxResponseBytes, int64(math.MaxInt64-1))
+	}
+	return defaultMaxResponseBytes
+}
 
-	data, _ := json.Marshal(cache)
-	os.Setenv(s.cacheKey(baseURL), string(data))
+type legacyLogHandler struct {
+	logger Logger
+	attrs  []slog.Attr
+	groups []string
+}
+
+func slogFor(logger Logger) *slog.Logger {
+	if logger == nil {
+		return nil
+	}
+	return slog.New(&legacyLogHandler{logger: logger})
+}
+
+func (*legacyLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *legacyLogHandler) Handle(_ context.Context, record slog.Record) error {
+	attrs := slices.Clone(h.attrs)
+	record.Attrs(func(attr slog.Attr) bool { attrs = append(attrs, attr); return true })
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s] %s", strings.ToUpper(record.Level.String()), record.Message)
+	for _, group := range h.groups {
+		fmt.Fprintf(&b, " group=%s", group)
+	}
+	for _, attr := range attrs {
+		fmt.Fprintf(&b, " %s=%s", attr.Key, attr.Value.String())
+	}
+	h.logger.Print(b.String())
 	return nil
 }
 
-func (s *Server) getCacheAccessToken(baseURL string) (string, bool) {
-	// Try the new per-username key first
-	data, ok := os.LookupEnv(s.cacheKey(baseURL))
-	if ok && data != "" {
-		cache := TokenCache{}
-		if err := json.Unmarshal([]byte(data), &cache); err == nil {
-			if time.Now().Unix() < int64(cache.ExpiresIn) {
-				return cache.AccessToken, true
-			}
-		}
-	}
-	s.clearTokenCache()
-	return "", false
+func (h *legacyLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	clone := *h
+	clone.attrs = append(slices.Clone(h.attrs), attrs...)
+	return &clone
 }
 
-func (s *Server) clearTokenCache() {
-	var baseURL string
-
-	if s.ServerURL == "" {
-		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
-	} else {
-		baseURL = s.ServerURL
-	}
-
-	// Clear the new per-username cache key
-	os.Setenv(s.cacheKey(baseURL), "")
-
-	// Also clear the legacy cache key to avoid leftover stale tokens
-	legacyKey := "SS_AT_" + url.QueryEscape(baseURL)
-	os.Setenv(legacyKey, "")
+func (h *legacyLogHandler) WithGroup(name string) slog.Handler {
+	clone := *h
+	clone.groups = append(slices.Clone(h.groups), name)
+	return &clone
 }
 
-// cacheKey returns an environment variable key unique to the base URL and
-// credentials (username). This prevents token collisions when multiple Server
-// instances use the same ServerURL but different credentials.
-func (s *Server) cacheKey(baseURL string) string {
-	key := "SS_AT_" + url.QueryEscape(baseURL)
-	if s.Credentials.Username != "" {
-		key = key + "_" + url.QueryEscape(s.Credentials.Username)
-	}
-	return key
-}
-
-// getAccessToken gets an OAuth2 Access Grant and returns the token
-// endpoint and get an accessGrant.
-func (s *Server) getAccessToken() (string, error) {
-	if s.Credentials.Token != "" {
-		return s.Credentials.Token, nil
-	}
-	var baseURL string
-
-	if s.ServerURL == "" {
-		baseURL = fmt.Sprintf(cloudBaseURLTemplate, s.Tenant, s.TLD)
-	} else {
-		baseURL = s.ServerURL
-	}
-
-	response, err := s.checkPlatformDetails(baseURL)
-	if err != nil {
-		s.log().Print("Error while checking server details:", err)
-		return "", err
-	}
-
-	if response == "" {
-		accessToken, found := s.getCacheAccessToken(baseURL)
-		if found {
-			return accessToken, nil
-		}
-
-		values := url.Values{
-			"username":   {s.Credentials.Username},
-			"password":   {s.Credentials.Password},
-			"grant_type": {"password"},
-		}
-		if s.Credentials.Domain != "" {
-			values["domain"] = []string{s.Credentials.Domain}
-		}
-
-		body := strings.NewReader(values.Encode())
-		requestUrl := s.urlFor("token", "")
-		data, _, err := handleResponse(http.Post(requestUrl, "application/x-www-form-urlencoded", body))
-
-		if err != nil {
-			s.log().Print("[ERROR] grant response error:", err)
-			return "", err
-		}
-
-		grant := struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-			TokenType    string `json:"token_type"`
-			ExpiresIn    int    `json:"expires_in"`
-		}{}
-
-		if err = json.Unmarshal(data, &grant); err != nil {
-			s.log().Print("[ERROR] parsing grant response:", err)
-			return "", err
-		}
-		if err = s.setCacheAccessToken(grant.AccessToken, grant.ExpiresIn, baseURL); err != nil {
-			s.log().Print("[ERROR] caching access token:", err)
-			return "", err
-		}
-		return grant.AccessToken, nil
-	}
-
-	return response, nil
-}
-
-func (s *Server) checkPlatformDetails(baseURL string) (string, error) {
-	platformHelthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "health")
-	ssHealthCheckUrl := fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "api/v1/healthcheck")
-
-	isHealthy := checkJSONResponse(ssHealthCheckUrl, s.log())
-	if isHealthy {
-		return "", nil
-	} else {
-		isHealthy := checkJSONResponse(platformHelthCheckUrl, s.log())
-		if isHealthy {
-
-			accessToken, found := s.getCacheAccessToken(baseURL)
-			if !found {
-				requestData := url.Values{}
-				requestData.Set("grant_type", "client_credentials")
-				requestData.Set("client_id", s.Credentials.Username)
-				requestData.Set("client_secret", s.Credentials.Password)
-				requestData.Set("scope", "xpmheadless")
-
-				req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "identity/api/oauth2/token/xpmplatform"), bytes.NewBufferString(requestData.Encode()))
-				if err != nil {
-					s.log().Print("Error creating HTTP request:", err)
-					return "", err
-				}
-
-				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-				data, _, err := handleResponse((&http.Client{}).Do(req))
-				if err != nil {
-					s.log().Print("[ERROR] get token response error:", err)
-					return "", err
-				}
-
-				var tokenjsonResponse OAuthTokens
-				if err = json.Unmarshal(data, &tokenjsonResponse); err != nil {
-					s.log().Print("[ERROR] parsing get token response:", err)
-					return "", err
-				}
-				accessToken = tokenjsonResponse.AccessToken
-
-				if err = s.setCacheAccessToken(tokenjsonResponse.AccessToken, tokenjsonResponse.ExpiresIn, baseURL); err != nil {
-					s.log().Print("[ERROR] caching access token:", err)
-					return "", err
-				}
-			}
-
-			req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", strings.Trim(baseURL, "/"), "vaultbroker/api/vaults"), bytes.NewBuffer([]byte{}))
-			if err != nil {
-				s.log().Print("Error creating HTTP request:", err)
-				return "", err
-			}
-			req.Header.Add("Authorization", "Bearer "+accessToken)
-
-			data, _, err := handleResponse((&http.Client{}).Do(req))
-			if err != nil {
-				s.log().Print("[ERROR] get vaults response error:", err)
-				return "", err
-			}
-
-			var vaultJsonResponse VaultsResponseModel
-			if err = json.Unmarshal(data, &vaultJsonResponse); err != nil {
-				s.log().Print("[ERROR] parsing vaults response:", err)
-				return "", err
-			}
-
-			var vaultURL string
-			for _, vault := range vaultJsonResponse.Vaults {
-				if vault.IsDefault && vault.IsActive {
-					vaultURL = vault.Connection.Url
-					break
-				}
-			}
-			if vaultURL != "" {
-				s.ServerURL = vaultURL
-			} else {
-				return "", fmt.Errorf("no configured vault found")
-			}
-
-			return accessToken, nil
-		}
-	}
-	return "", fmt.Errorf("invalid URL")
-}
-
-func checkJSONResponse(url string, logger Logger) bool {
-	response, err := http.Get(url)
-	if err != nil {
-		logger.Println("Error making GET request:", err)
-		return false
-	}
-	defer response.Body.Close()
-
-	body, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		logger.Println("Error reading response body:", err)
-		return false
-	}
-
-	var jsonResponse Response
-	err = json.Unmarshal(body, &jsonResponse)
-	if err == nil {
-		return jsonResponse.Healthy
-	} else {
-		return strings.Contains(string(body), "Healthy")
-	}
-}
-
+// Deprecated wire types retained for v3 compatibility.
 type Response struct {
 	Healthy               bool `json:"healthy"`
 	DatabaseHealthy       bool `json:"databaseHealthy"`

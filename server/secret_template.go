@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 )
 
@@ -25,11 +27,16 @@ type SecretTemplateField struct {
 
 // SecretTemplate gets the secret template with id from the Secret Server of the given tenant
 func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
+	return s.SecretTemplateContext(context.Background(), id)
+}
+
+// SecretTemplateContext is SecretTemplate with caller-controlled cancellation and deadlines.
+func (s Server) SecretTemplateContext(ctx context.Context, id int) (*SecretTemplate, error) {
 	secretTemplate := new(SecretTemplate)
 
-	if data, err := s.accessResource("GET", templateResource, strconv.Itoa(id), nil); err == nil {
+	if data, err := s.accessResourceContext(ctx, http.MethodGet, templateResource, strconv.Itoa(id), nil); err == nil {
 		if err = json.Unmarshal(data, secretTemplate); err != nil {
-			s.log().Printf("[ERROR] error parsing response from /%s/%d: %q", templateResource, id, data)
+			s.log().Printf("[ERROR] parsing response from /%s/%d: %v (%d-byte body not logged)", templateResource, id, err, len(data))
 			return nil, err
 		}
 	} else {
@@ -43,17 +50,31 @@ func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
 // template. The password adheres to the password requirements associated with the field. NOTE: this should only be
 // used with fields whose IsPassword property is true.
 func (s Server) GeneratePassword(slug string, template *SecretTemplate) (string, error) {
+	return s.GeneratePasswordContext(context.Background(), slug, template)
+}
+
+// GeneratePasswordContext is GeneratePassword with caller-controlled cancellation and deadlines.
+func (s Server) GeneratePasswordContext(ctx context.Context, slug string, template *SecretTemplate) (string, error) {
+	if template == nil {
+		return "", fmt.Errorf("no secret template was given")
+	}
 
 	fieldId, found := template.FieldSlugToId(slug)
 
 	if !found {
-		s.log().Printf("[ERROR] the alias '%s' does not identify a field on the template named '%s'", slug, template.Name)
+		return "", fmt.Errorf("the alias '%s' does not identify a field on the template named '%s'", slug, template.Name)
 	}
 	path := fmt.Sprintf("generate-password/%d", fieldId)
 
-	if data, err := s.accessResource("POST", templateResource, path, nil); err == nil {
-		passwordWithQuotes := string(data)
-		return passwordWithQuotes[1 : len(passwordWithQuotes)-1], nil
+	if data, err := s.accessResourceContext(ctx, http.MethodPost, templateResource, path, nil); err == nil {
+		var password *string
+		if err := json.Unmarshal(data, &password); err != nil {
+			return "", fmt.Errorf("parsing generate-password response: %w", err)
+		}
+		if password == nil || *password == "" {
+			return "", fmt.Errorf("generate-password response contained no password")
+		}
+		return *password, nil
 	} else {
 		return "", err
 	}
@@ -83,9 +104,9 @@ func (s SecretTemplate) FieldSlugToId(slug string) (int, bool) {
 // GetField returns the field with the given shorthand alias (aka: "slug"), and a boolean indicating whether the given
 // slug actually identifies a field for the secret template .
 func (s SecretTemplate) GetField(slug string) (*SecretTemplateField, bool) {
-	for _, field := range s.Fields {
-		if slug == field.FieldSlugName {
-			return &field, true
+	for i := range s.Fields {
+		if slug == s.Fields[i].FieldSlugName {
+			return &s.Fields[i], true
 		}
 	}
 	return nil, false

@@ -3,53 +3,107 @@ name: Tests
 on:
   workflow_dispatch:
   push:
-    # Publish the `master` branch.
-    branches:
-      - main
-
-    # Publish `v1.2.3` tags as releases.
-    tags:
-      - v*
-
+    branches: [main, delegate-to-delinea-tools]
+    tags: ['v*']
   pull_request:
-    branches:
-      - main
+    branches: [main]
+
+permissions:
+  contents: read
 
 env:
-  TSS_TENANT: ${{ secrets.TSS_TENANT }}
-  TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
-  TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
-  TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
-  TSS_SECRET_PATH: ${{ secrets.TSS_SECRET_PATH }}
-  TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
-  TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
-  TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
-  TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
-  TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
-  TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
-  TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
-  TSS_PLATFORM_USERNAME: ${{ secrets.TSS_PLATFORM_USERNAME }}
-  TSS_PLATFORM_PASSWORD: ${{ secrets.TSS_PLATFORM_PASSWORD }}
-  TSS_PLATFORM_URL: ${{ secrets.TSS_PLATFORM_URL }}
+  GOPRIVATE: github.com/DelineaXPM/*
+  GONOSUMDB: github.com/DelineaXPM/*
 
 jobs:
-  build:
-    name: Build
+  verify:
+    name: Build and test
     runs-on: ubuntu-latest
     steps:
-      - name: Check out code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Go
-        uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: '1.21'
+          go-version: '1.26.6'
+          check-latest: true
+      - name: Authenticate private delinea-tools dependency
+        env:
+          READ_TOKEN: ${{ secrets.DELINEA_TOOLS_READ_TOKEN }}
+        run: |
+          test -n "$READ_TOKEN"
+          git config --global url."https://x-access-token:${READ_TOKEN}@github.com/".insteadOf "https://github.com/"
+      - run: go mod download
+      - run: go build -v ./...
+      - run: go test -race ./...
 
-      - name: Get dependencies
-        run: go get -v -t -d ./...
+  analysis:
+    name: Static and vulnerability analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.26.6'
+          check-latest: true
+      - name: Authenticate private delinea-tools dependency
+        env:
+          READ_TOKEN: ${{ secrets.DELINEA_TOOLS_READ_TOKEN }}
+        run: |
+          test -n "$READ_TOKEN"
+          git config --global url."https://x-access-token:${READ_TOKEN}@github.com/".insteadOf "https://github.com/"
+      - run: go mod download
+      - run: go vet ./...
+      - run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2026.1
+          staticcheck ./...
+      - run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
 
-      - name: Build
-        run: go build -v ./server
-
-      - name: Test
-        run: go test -v ./server
+  integration:
+    name: Live Secret Server and Platform
+    runs-on: ubuntu-latest
+    concurrency:
+      group: live-tenant-battery
+      cancel-in-progress: false
+    env:
+      TSS_REQUIRE_SECRET_SERVER: ${{ secrets.TSS_USERNAME != '' && '1' || '' }}
+      TSS_REQUIRE_PLATFORM: ${{ secrets.TSS_PLATFORM_USERNAME != '' && secrets.TSS_PLATFORM_SECRET_ID != '' && '1' || '' }}
+      TSS_TENANT: ${{ secrets.TSS_TENANT }}
+      TSS_SERVER_URL: ${{ secrets.TSS_SERVER_URL }}
+      TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
+      TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
+      TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
+      TSS_SECRET_PATH: ${{ secrets.TSS_SECRET_PATH }}
+      TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
+      TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
+      TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
+      TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
+      TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
+      TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
+      TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
+      TSS_PLATFORM_USERNAME: ${{ secrets.TSS_PLATFORM_USERNAME }}
+      TSS_PLATFORM_PASSWORD: ${{ secrets.TSS_PLATFORM_PASSWORD }}
+      TSS_PLATFORM_URL: ${{ secrets.TSS_PLATFORM_URL }}
+      TSS_PLATFORM_ALLOWED_VAULT_HOSTS: ${{ secrets.TSS_PLATFORM_ALLOWED_VAULT_HOSTS }}
+      TSS_PLATFORM_SECRET_ID: ${{ secrets.TSS_PLATFORM_SECRET_ID }}
+      TSS_PLATFORM_SECRET_PATH: ${{ secrets.TSS_PLATFORM_SECRET_PATH }}
+      TSS_PLATFORM_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_TEMPLATE_ID }}
+      TSS_PLATFORM_FOLDER_ID: ${{ secrets.TSS_PLATFORM_FOLDER_ID }}
+      TSS_PLATFORM_SITE_ID: ${{ secrets.TSS_PLATFORM_SITE_ID }}
+      TSS_PLATFORM_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_SSH_KEY_TEMPLATE_ID }}
+      TSS_PLATFORM_TEST_PASSWORD: ${{ secrets.TSS_PLATFORM_TEST_PASSWORD }}
+      TSS_PLATFORM_SEARCH_FIELD: ${{ secrets.TSS_PLATFORM_SEARCH_FIELD }}
+      TSS_PLATFORM_SEARCH_TEXT: ${{ secrets.TSS_PLATFORM_SEARCH_TEXT }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.26.6'
+          check-latest: true
+      - name: Authenticate private delinea-tools dependency
+        env:
+          READ_TOKEN: ${{ secrets.DELINEA_TOOLS_READ_TOKEN }}
+        run: |
+          test -n "$READ_TOKEN"
+          git config --global url."https://x-access-token:${READ_TOKEN}@github.com/".insteadOf "https://github.com/"
+      - run: go test -race -v ./server
