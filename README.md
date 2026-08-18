@@ -5,6 +5,11 @@
 A Golang API and examples for [Delinea](https://delinea.com/)
 [Secret Server](https://delinea.com/products/secret-server/).
 
+The v3.1 client requires Go 1.26.6. Its authentication, token caching, TLS,
+retry, backend-probing, and Platform vault-routing engine is provided by
+`github.com/DelineaXPM/delinea-tools/api`; this module retains the established
+typed Secret Server models and operations.
+
 ## Configure
 
 The API requires a `Configuration` object containing a `Username`, `Password`
@@ -16,20 +21,41 @@ type UserCredential struct {
 }
 
 type Configuration struct {
-    Credentials UserCredential
-    ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
-    TLSClientConfig *tls.Config // Optional: custom TLS configuration
-    Logger          Logger      // Optional: custom logger (silent by default)
+    Credentials       UserCredential
+    ServerURL         string
+    TLD               string
+    Tenant            string
+    TLSClientConfig   *tls.Config
+    Logger            Logger
+    Timeout           time.Duration
+    MaxRetries        int
+    DisableRetries    bool
+    RetryBaseDelay    time.Duration
+    AllowedVaultHosts string // comma-separated exact host or host:port values
+    MaxResponseBytes  int64
 }
 ```
+
+`New` validates and snapshots this configuration without network I/O. The first
+operation probes the configured URL when username/password credentials could
+refer to either Secret Server or Platform. A supplied bearer token skips probing
+and is sent directly to Secret Server, preserving v3.0 behavior. Mutating the
+embedded configuration after `New` does not reconfigure the client.
+Construct `Server` values with `New`; a manually assembled `Server` has no runtime
+client and its network methods return a constructor-required error.
+
+`Timeout` is a progress limit for response headers and stalled body reads, not a
+total duration for a continuously flowing response. `MaxRetries` counts retries
+after the first GET/HEAD or token-grant attempt; zero selects the engine default
+and `DisableRetries` selects one attempt. Mutating requests are never replayed.
 
 ## Use
 
 Define a `Configuration`, use it to create an instance of `Server` for Secret Server:
 
 ```golang
-tss := server.New(server.Configuration{
-    Credentials: UserCredential{
+tss, err := server.New(server.Configuration{
+    Credentials: server.UserCredential{
         Username: os.Getenv("TSS_USERNAME"),
         Password: os.Getenv("TSS_PASSWORD"),
     },
@@ -37,6 +63,9 @@ tss := server.New(server.Configuration{
     Tenant:    os.Getenv("TSS_API_TENANT"),
     ServerURL: os.Getenv("TSS_SERVER_URL"),
 })
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 OR
@@ -44,13 +73,16 @@ OR
 Define a `Configuration`, use it to create an instance of `Server` for Platform:
 
 ```golang
-tss := server.New(server.Configuration{
-    Credentials: UserCredential{
+tss, err := server.New(server.Configuration{
+    Credentials: server.UserCredential{
         Username: os.Getenv("TSS_PLATFORM_USERNAME"),
         Password: os.Getenv("TSS_PLATFORM_PASSWORD"),
     },
     ServerURL: os.Getenv("TSS_PLATFORM_URL"),
 })
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 Get a secret by its numeric ID:
@@ -66,6 +98,10 @@ if pw, ok := secret.Field("password"); ok {
     fmt.Print("the password is", pw)
 }
 ```
+
+Every network operation also has a `Context` variant, such as
+`SecretContext`, `CreateSecretContext`, and `GeneratePasswordContext`, for
+caller-controlled cancellation and deadlines.
 
 Get a Secret by Path:
 
@@ -176,6 +212,22 @@ tss, err := server.New(server.Configuration{
 
 ## Test
 
+### Private dependency during facade development
+
+Until `delinea-tools` is public at v1.0.0, this branch uses its private v0.1.0
+candidate without a `replace` directive. Local development requires GitHub read
+access and:
+
+```shell
+go env -w GOPRIVATE='github.com/DelineaXPM/*'
+go env -w GONOSUMDB='github.com/DelineaXPM/*'
+gh auth setup-git
+```
+
+CI temporarily requires a read-only `DELINEA_TOOLS_READ_TOKEN` repository
+secret. Before releasing tss-sdk-go, update `go.mod` to the public immutable
+`delinea-tools` v1.0.0 tag and remove this temporary authentication setup.
+
 The tests populate a `Configuration` from JSON:
 
 ```golang
@@ -185,7 +237,10 @@ if cj, err := ioutil.ReadFile("../test_config.json"); err == nil {
     json.Unmarshal(cj, &config)
 }
 
-tss := New(*config)
+tss, err := New(*config)
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 `../test_config.json`:

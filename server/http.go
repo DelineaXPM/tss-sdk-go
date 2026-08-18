@@ -2,33 +2,60 @@ package server
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"strings"
+	"unicode"
+
+	delinea "github.com/DelineaXPM/delinea-tools/api"
 )
 
 const errorBodyLength = 255
 
-// handleResponse processes the response according to the HTTP status
-func handleResponse(res *http.Response, err error) ([]byte, *http.Response, error) {
-	if err != nil { // fall-through if there was an underlying err
-		return nil, res, err
+// HTTPError is returned for a non-2xx response. Error retains the historical
+// "<status>: <body>" form while exposing structured status information.
+type HTTPError struct {
+	StatusCode int
+	Status     string
+	Body       string
+	RetryAfter string
+}
+
+func (e *HTTPError) Error() string { return fmt.Sprintf("%s: %s", e.Status, e.Body) }
+
+func handleBufferedResponse(response *delinea.BufferedResponse, limit int64) ([]byte, error) {
+	if response == nil {
+		return nil, fmt.Errorf("HTTP request returned neither a response nor an error")
 	}
-
-	data, err := ioutil.ReadAll(res.Body)
-
-	if err != nil {
-		return nil, res, err
+	oversize := int64(len(response.Body)) > limit
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		if oversize {
+			return nil, fmt.Errorf("response body exceeded %d bytes", limit)
+		}
+		return response.Body, nil
 	}
-
-	// if the response was 2xx then return it, otherwise, consider it an error
-	if res.StatusCode > 199 && res.StatusCode < 300 {
-		return data, res, nil
+	status := fmt.Sprintf("%d %s", response.StatusCode, http.StatusText(response.StatusCode))
+	status = strings.TrimSpace(status)
+	diagnostic := truncateDiagnostic(response.DiagnosticSnippet(), errorBodyLength)
+	if oversize {
+		diagnostic += fmt.Sprintf(" (response body exceeded %d bytes)", limit)
 	}
-
-	// truncate the data to errorBodyLength bytes before returning it as part of the error
-	if len(data) >= errorBodyLength {
-		data = append(data[:errorBodyLength], []byte("...")...)
+	return nil, &HTTPError{
+		StatusCode: response.StatusCode,
+		Status:     status,
+		Body:       diagnostic,
+		RetryAfter: response.Header.Get("Retry-After"),
 	}
+}
 
-	return nil, res, fmt.Errorf("%s: %s", res.Status, string(data))
+func truncateDiagnostic(value string, limit int) string {
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, value)
+	if len(value) >= limit {
+		return value[:limit] + "..."
+	}
+	return value
 }
