@@ -26,13 +26,16 @@ type Configuration struct {
     TLD               string
     Tenant            string
     TLSClientConfig   *tls.Config
+    CACertPEM         string
     Logger            Logger
+    AllowInsecureHTTP bool
     Timeout           time.Duration
     MaxRetries        int
     DisableRetries    bool
     RetryBaseDelay    time.Duration
     AllowedVaultHosts string // comma-separated exact host or host:port values
     MaxResponseBytes  int64
+    MaxAttachmentDownloads int
 }
 ```
 
@@ -44,10 +47,22 @@ embedded configuration after `New` does not reconfigure the client.
 Construct `Server` values with `New`; a manually assembled `Server` has no runtime
 client and its network methods return a constructor-required error.
 
-`Timeout` is a progress limit for response headers and stalled body reads, not a
-total duration for a continuously flowing response. `MaxRetries` counts retries
+Remote plaintext HTTP URLs are rejected by default. Set `AllowInsecureHTTP` only
+for an explicitly accepted non-loopback HTTP deployment; loopback development
+servers remain usable without it. For private certificate authorities, prefer
+`CACertPEM` so identically configured `Server` instances can safely share token
+grants. `TLSClientConfig` remains available for advanced TLS customization but
+isolates each `Server` from cross-instance token sharing. The two TLS settings
+cannot be combined.
+
+`Timeout` is a total deadline for each context-free SDK operation and also a
+progress limit for response headers and stalled body reads. A `Context` method
+uses the caller's context for its total deadline. `MaxRetries` counts retries
 after the first GET/HEAD or token-grant attempt; zero selects the engine default
 and `DisableRetries` selects one attempt. Mutating requests are never replayed.
+`MaxResponseBytes` limits the combined buffered response bodies for one SDK
+operation, including automatically downloaded attachments.
+`MaxAttachmentDownloads` limits those automatic downloads and defaults to 100.
 
 ## Use
 

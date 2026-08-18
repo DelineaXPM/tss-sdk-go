@@ -102,7 +102,7 @@ func SecretCRUD(t *testing.T, tss *Server) {
 	if sc == nil {
 		t.Fatal("created secret data is nil")
 	}
-	deleteAfterTest(t, tss, sc.ID)
+	markDeleted := deleteAfterTest(t, tss, sc.ID)
 	if !validate("created secret folder id", folderId, sc.FolderID, t) {
 		return
 	}
@@ -125,7 +125,7 @@ func SecretCRUD(t *testing.T, tss *Server) {
 	if !matched {
 		t.Fatalf("created secret does not have a password field with the given field id '%d':", passwordFieldID)
 	}
-	if !validate("created secret password value", testPassword, createdPassword, t) {
+	if !validateSensitive("created secret password value", testPassword, createdPassword, t) {
 		return
 	}
 
@@ -158,7 +158,7 @@ func SecretCRUD(t *testing.T, tss *Server) {
 	if !matched {
 		t.Fatalf("updated secret does not have a password field with the given field id '%d':", passwordFieldID)
 	}
-	if !validate("updated secret password value", newPassword, updatedPassword, t) {
+	if !validateSensitive("updated secret password value", newPassword, updatedPassword, t) {
 		return
 	}
 
@@ -167,6 +167,7 @@ func SecretCRUD(t *testing.T, tss *Server) {
 	if err != nil {
 		t.Fatal("calling server.DeleteSecret:", err)
 	}
+	markDeleted()
 
 	// A deleted secret must not come back live. Secret Server refuses the read with
 	// API_AccessDenied; a Platform vault keeps the recycled secret readable with Active
@@ -277,7 +278,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	if sc == nil {
 		t.Fatal("created secret data is nil")
 	}
-	deleteAfterTest(t, tss, sc.ID)
+	markDeleted := deleteAfterTest(t, tss, sc.ID)
 	if !validate("created secret name", "Test SSH Key Secret", sc.Name, t) {
 		return
 	}
@@ -337,7 +338,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 		if !validate("created secret password field is a password field", true, passwordField.IsPassword, t) {
 			return
 		}
-		if !validate("created secret password field has the given value", password, passwordField.ItemValue, t) {
+		if !validateSensitive("created secret password field has the given value", password, passwordField.ItemValue, t) {
 			return
 		}
 	} else if problem {
@@ -418,7 +419,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 		if !validate("read secret password field is a password field", true, passwordField.IsPassword, t) {
 			return
 		}
-		if !validate("read secret password field has the given value", password, passwordField.ItemValue, t) {
+		if !validateSensitive("read secret password field has the given value", password, passwordField.ItemValue, t) {
 			return
 		}
 	} else if problem {
@@ -505,7 +506,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 		if !validate("updated secret password field is a password field", true, passwordField.IsPassword, t) {
 			return
 		}
-		if !validate("updated secret password field has the given value", password, passwordField.ItemValue, t) {
+		if !validateSensitive("updated secret password field has the given value", password, passwordField.ItemValue, t) {
 			return
 		}
 	} else if problem {
@@ -524,6 +525,7 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	if err != nil {
 		t.Fatal("calling server.DeleteSecret:", err)
 	}
+	markDeleted()
 
 	// A deleted secret must not come back live. Secret Server refuses the read with
 	// API_AccessDenied; a Platform vault keeps the recycled secret readable with Active
@@ -625,6 +627,17 @@ func validate(label string, expected interface{}, found interface{}, t *testing.
 	t.Helper()
 	if expected != found {
 		t.Errorf("%s: got %v, want %v", label, found, expected)
+		return false
+	}
+	return true
+}
+
+// validateSensitive compares live credential values without copying either value
+// into test output on failure.
+func validateSensitive(label, expected, found string, t *testing.T) bool {
+	t.Helper()
+	if expected != found {
+		t.Errorf("%s: values differ (got length %d, want length %d)", label, len(found), len(expected))
 		return false
 	}
 	return true

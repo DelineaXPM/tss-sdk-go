@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -117,6 +120,40 @@ func TestFacadePlatformRoutesTypedCallsThroughVault(t *testing.T) {
 	}
 }
 
+func TestFacadeRejectsImplicitCloudVaultAlternatePort(t *testing.T) {
+	const untrustedVault = "https://x.secretservercloud.com:8443"
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/healthcheck":
+			http.NotFound(w, r)
+		case "/health":
+			fmt.Fprint(w, `{"healthy":true}`)
+		case "/identity/api/oauth2/token/xpmplatform":
+			writeGrant(w)
+		case "/vaultbroker/api/vaults":
+			fmt.Fprintf(w, `{"vaults":[{"vaultId":"v1","isDefault":true,"isActive":true,"connection":{"url":%q}}]}`, untrustedVault)
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	client, err := New(Configuration{
+		ServerURL: srv.URL,
+		Credentials: UserCredential{
+			Username: "vault-port-client", Password: "vault-port-secret",
+		},
+		CACertPEM: string(certPEM), DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Secret(9); err == nil || !strings.Contains(err.Error(), "untrusted vault host") {
+		t.Fatalf("got %v, want alternate-port vault rejection", err)
+	}
+}
+
 func TestFacadeSuppliedTokenSkipsProbeAndGrant(t *testing.T) {
 	const token = "supplied-facade-token"
 	var calls atomic.Int32
@@ -174,6 +211,80 @@ func TestFacadeHTTPErrorUsesRequestBoundRedaction(t *testing.T) {
 	}
 }
 
+func TestFacadeSensitiveWriteErrorWithholdsResponseBody(t *testing.T) {
+	const submitted = "submitted-secret-value"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/secret-templates/1":
+			fmt.Fprint(w, `{"ID":1,"Fields":[{"SecretTemplateFieldID":10,"FieldSlugName":"password","IsPassword":true}]}`)
+		case "/api/v1/secrets/":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("reading request: %v", err)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write(body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "write-error-token"},
+		DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateSecret(Secret{
+		SecretTemplateID: 1,
+		Fields:           []SecretField{{Slug: "password", ItemValue: submitted}},
+	})
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("got %T %v, want *HTTPError", err, err)
+	}
+	if strings.Contains(httpErr.Error(), submitted) || httpErr.Body != withheldDiagnostic {
+		t.Fatalf("unsafe sensitive-request diagnostic: %v", httpErr)
+	}
+}
+
+func TestFacadeSensitiveQueryErrorWithholdsResponseBody(t *testing.T) {
+	const secretPath = `\folder\sensitive-name`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, r.URL.RawQuery)
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "query-error-token"},
+		DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.SecretByPath(secretPath)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("got %T %v, want *HTTPError", err, err)
+	}
+	if strings.Contains(httpErr.Error(), "sensitive-name") || httpErr.Body != withheldDiagnostic {
+		t.Fatalf("unsafe sensitive-query diagnostic: %v", httpErr)
+	}
+}
+
+func TestFacadeRejectsRemotePlainHTTPByDefault(t *testing.T) {
+	config := Configuration{ServerURL: "http://example.com", Credentials: UserCredential{Token: "http-token"}}
+	if _, err := New(config); err == nil {
+		t.Fatal("remote plaintext HTTP was accepted without explicit opt-in")
+	}
+	config.AllowInsecureHTTP = true
+	if _, err := New(config); err != nil {
+		t.Fatalf("explicit plaintext HTTP opt-in was rejected: %v", err)
+	}
+}
+
 func TestFacadeTLSConfigIsServerScoped(t *testing.T) {
 	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeSecret(w, 4)
@@ -196,6 +307,21 @@ func TestFacadeTLSConfigIsServerScoped(t *testing.T) {
 	}
 	if http.DefaultTransport != defaultTransport {
 		t.Fatal("New mutated http.DefaultTransport")
+	}
+}
+
+func TestFacadePEMRootConfigurationValidation(t *testing.T) {
+	base := Configuration{ServerURL: "https://example.com", Credentials: UserCredential{Token: "pem-token"}}
+	invalid := base
+	invalid.CACertPEM = "not a certificate"
+	if _, err := New(invalid); err == nil {
+		t.Fatal("invalid CACertPEM was accepted")
+	}
+	conflicting := base
+	conflicting.CACertPEM = "not relevant"
+	conflicting.TLSClientConfig = &tls.Config{}
+	if _, err := New(conflicting); err == nil {
+		t.Fatal("CACertPEM and TLSClientConfig were accepted together")
 	}
 }
 
@@ -399,6 +525,48 @@ func TestFacadeLoggerAdapterKeepsCredentialsRedacted(t *testing.T) {
 	}
 }
 
+func TestFacadeLoggerAdapterNeutralizesForgedRecords(t *testing.T) {
+	logger := new(recordingLogger)
+	slogFor(logger).WithGroup("group\nforged").Info(
+		"message\r\nforged\x1b", "key\nforged", "value\rforged\u2066",
+	)
+	output := logger.String()
+	if strings.Count(output, "\n") != 1 || strings.ContainsAny(output, "\r\x1b\u2066") {
+		t.Fatalf("logger emitted record-breaking control characters: %q", output)
+	}
+	if !strings.Contains(output, "message??forged?") {
+		t.Fatalf("logger did not visibly neutralize controls: %q", output)
+	}
+}
+
+func TestCredentialDiagnosticsNeutralizeForgedRecords(t *testing.T) {
+	credential := UserCredential{
+		Domain: "domain\nforged", Username: "user\r\u2066forged",
+		Password: "diagnostic-password", Token: "diagnostic-token",
+	}
+	for name, diagnostic := range map[string]string{
+		"String":   credential.String(),
+		"GoString": credential.GoString(),
+		"JSON":     string(mustJSON(t, credential)),
+	} {
+		if strings.ContainsAny(diagnostic, "\n\r\u2066") {
+			t.Errorf("%s retained record-breaking characters: %q", name, diagnostic)
+		}
+		if strings.Contains(diagnostic, credential.Password) || strings.Contains(diagnostic, credential.Token) {
+			t.Errorf("%s retained credentials: %q", name, diagnostic)
+		}
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 func TestFacadeAdopts401RefreshAnd403AuthorizationPolicy(t *testing.T) {
 	var grants, reads atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +680,103 @@ func TestFacadeRetryAndResponseLimitMapping(t *testing.T) {
 	})
 }
 
+func TestFacadeLegacyOperationTimeoutIsTotal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("response writer does not support flushing")
+			return
+		}
+		fmt.Fprint(w, `{"ID":1`)
+		flusher.Flush()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				fmt.Fprint(w, " ")
+				flusher.Flush()
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Configuration{
+		ServerURL: srv.URL, Credentials: UserCredential{Token: "total-timeout-token"},
+		Timeout: 50 * time.Millisecond, DisableRetries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = client.Secret(1)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("legacy operation exceeded its total deadline: %v", elapsed)
+	}
+}
+
+func TestFacadeAttachmentBudgetsCoverWholeOperation(t *testing.T) {
+	t.Run("response bytes are cumulative", func(t *testing.T) {
+		const metadata = `{"ID":1,"Items":[{"Slug":"file","IsFile":true,"FileAttachmentID":1,"Filename":"file.txt"}]}`
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/v1/secrets/1":
+				fmt.Fprint(w, metadata)
+			case "/api/v1/secrets/1/fields/file":
+				fmt.Fprint(w, "1234567890")
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		client, err := New(Configuration{
+			ServerURL: srv.URL, Credentials: UserCredential{Token: "cumulative-limit-token"},
+			MaxResponseBytes: int64(len(metadata) + 5), DisableRetries: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Secret(1); err == nil || !strings.Contains(err.Error(), "exceeded 5 bytes") {
+			t.Fatalf("got %v, want cumulative response-cap error", err)
+		}
+	})
+
+	t.Run("attachment downloads are counted", func(t *testing.T) {
+		const metadata = `{"ID":2,"Items":[{"Slug":"one","IsFile":true,"FileAttachmentID":1,"Filename":"one.txt"},{"Slug":"two","IsFile":true,"FileAttachmentID":2,"Filename":"two.txt"}]}`
+		var downloads atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/v1/secrets/2" {
+				fmt.Fprint(w, metadata)
+				return
+			}
+			if strings.HasPrefix(r.URL.Path, "/api/v1/secrets/2/fields/") {
+				downloads.Add(1)
+				fmt.Fprint(w, "file")
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		t.Cleanup(srv.Close)
+		client, err := New(Configuration{
+			ServerURL: srv.URL, Credentials: UserCredential{Token: "attachment-count-token"},
+			MaxAttachmentDownloads: 1, DisableRetries: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Secret(2); err == nil || !strings.Contains(err.Error(), "exceeded 1 attachment downloads") {
+			t.Fatalf("got %v, want attachment-count error", err)
+		}
+		if downloads.Load() != 1 {
+			t.Fatalf("downloads=%d, want one", downloads.Load())
+		}
+	})
+}
+
 func TestFacadeCrossServerCacheDependsOnTLSOpacity(t *testing.T) {
 	t.Run("ordinary servers share a grant", func(t *testing.T) {
 		var grants atomic.Int32
@@ -595,6 +860,49 @@ func TestFacadeCrossServerCacheDependsOnTLSOpacity(t *testing.T) {
 		}
 		if grants.Load() != 2 {
 			t.Fatalf("grants=%d, want one per TLS-configured Server", grants.Load())
+		}
+	})
+
+	t.Run("PEM-configured servers share a grant", func(t *testing.T) {
+		var grants atomic.Int32
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/v1/healthcheck":
+				fmt.Fprint(w, `{"healthy":true}`)
+			case "/oauth2/token":
+				grants.Add(1)
+				writeGrant(w)
+			case "/api/v1/secrets/8":
+				writeSecret(w, 8)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+		config := Configuration{
+			ServerURL: srv.URL,
+			Credentials: UserCredential{
+				Username: "pem-cache-user", Password: "pem-cache-password-value",
+			},
+			CACertPEM: string(certPEM), DisableRetries: true,
+		}
+		first, err := New(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := New(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := first.Secret(8); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := second.Secret(8); err != nil {
+			t.Fatal(err)
+		}
+		if grants.Load() != 1 {
+			t.Fatalf("grants=%d, want one shared grant", grants.Load())
 		}
 	})
 }

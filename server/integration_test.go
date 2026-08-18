@@ -139,7 +139,16 @@ func integrationRequired(t *testing.T) bool {
 	return os.Getenv(integrationOptIn) != ""
 }
 
-func deleteAfterTest(t *testing.T, server *Server, secretID int) {
+func deleteAfterTest(t *testing.T, server *Server, secretID int) func() {
 	t.Helper()
-	t.Cleanup(func() { _ = server.DeleteSecret(secretID) })
+	deleted := false
+	t.Cleanup(func() {
+		if deleted {
+			return
+		}
+		if err := server.DeleteSecret(secretID); err != nil {
+			t.Errorf("cleaning up test secret %d: %v", secretID, err)
+		}
+	})
+	return func() { deleted = true }
 }

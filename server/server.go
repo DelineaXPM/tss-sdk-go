@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,16 +20,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	delinea "github.com/DelineaXPM/delinea-tools/api"
 )
 
 const (
 	defaultAPIPathURI       = "/api/v1"
-	defaultTokenPathURI     = "/oauth2/token"
 	defaultTLD              = "com"
 	defaultHTTPTimeout      = 60 * time.Second
 	defaultMaxResponseBytes = 100 << 20
+	defaultMaxAttachments   = 100
 )
 
 // Logger is an interface for logging in the SDK. It matches the standard log package interface.
@@ -61,19 +63,19 @@ type UserCredential struct {
 }
 
 func (c UserCredential) String() string {
-	return fmt.Sprintf("{Domain:%s Username:%s Password:%s Token:%s}",
-		c.Domain, c.Username, redactSecret(c.Password), redactSecret(c.Token))
+	return fmt.Sprintf("{Domain:%q Username:%q Password:%s Token:%s}",
+		sanitizeLogText(c.Domain), sanitizeLogText(c.Username), redactSecret(c.Password), redactSecret(c.Token))
 }
 
 func (c UserCredential) GoString() string {
 	return fmt.Sprintf("server.UserCredential{Domain:%q, Username:%q, Password:%q, Token:%q}",
-		c.Domain, c.Username, redactSecret(c.Password), redactSecret(c.Token))
+		sanitizeLogText(c.Domain), sanitizeLogText(c.Username), redactSecret(c.Password), redactSecret(c.Token))
 }
 
 func (c UserCredential) MarshalJSON() ([]byte, error) {
 	type redactedCredential struct{ Domain, Username, Password, Token string }
 	return json.Marshal(redactedCredential{
-		Domain: c.Domain, Username: c.Username,
+		Domain: sanitizeLogText(c.Domain), Username: sanitizeLogText(c.Username),
 		Password: redactSecret(c.Password), Token: redactSecret(c.Token),
 	})
 }
@@ -88,26 +90,31 @@ func redactSecret(value string) string {
 // Configuration settings for the API. Configuration is snapshotted by New;
 // mutating it through the returned Server does not reconfigure the live client.
 type Configuration struct {
-	Credentials                                      UserCredential
-	ServerURL, TLD, Tenant, apiPathURI, tokenPathURI string
-	TLSClientConfig                                  *tls.Config `json:"-"`
-	Logger                                           Logger      `json:"-"`
-	Timeout                                          time.Duration
-	MaxRetries                                       int
-	DisableRetries                                   bool
-	RetryBaseDelay                                   time.Duration
+	Credentials                        UserCredential
+	ServerURL, TLD, Tenant, apiPathURI string
+	TLSClientConfig                    *tls.Config `json:"-"`
+	// CACertPEM adds PEM-encoded private roots while retaining safe cross-Server
+	// token sharing. Prefer it to TLSClientConfig when custom roots are the only
+	// TLS customization required.
+	CACertPEM         string
+	Logger            Logger `json:"-"`
+	AllowInsecureHTTP bool
+	Timeout           time.Duration
+	MaxRetries        int
+	DisableRetries    bool
+	RetryBaseDelay    time.Duration
 	// AllowedVaultHosts is a comma-separated list of exact host or host:port
 	// values trusted for Platform-discovered vault URLs. A string keeps the
 	// published Configuration and Server types comparable.
-	AllowedVaultHosts string
-	MaxResponseBytes  int64
+	AllowedVaultHosts      string
+	MaxResponseBytes       int64
+	MaxAttachmentDownloads int
 
 	runtime *serverRuntime
 }
 
-// Server provides access to secrets stored in Delinea Secret Server.
-// Its public layout remains the v3.0.2 layout; runtime state is carried in the
-// private portion of the embedded Configuration.
+// Server provides access to secrets stored in Delinea Secret Server. Runtime
+// state is carried in the private portion of the embedded Configuration.
 type Server struct {
 	Configuration
 }
@@ -127,12 +134,37 @@ type clientInitialization struct {
 }
 
 type serverRuntime struct {
-	mu            sync.Mutex
-	client        *delinea.Client
-	starting      *clientInitialization
-	config        delinea.Config
-	logger        Logger
-	responseLimit int64
+	mu             sync.Mutex
+	client         *delinea.Client
+	starting       *clientInitialization
+	config         delinea.Config
+	logger         Logger
+	responseLimit  int64
+	timeout        time.Duration
+	maxAttachments int
+}
+
+type operationBudget struct {
+	initialBytes   int64
+	remainingBytes int64
+	attachments    int
+	maxAttachments int
+}
+
+func (b *operationBudget) consume(body []byte) error {
+	if int64(len(body)) > b.remainingBytes {
+		return fmt.Errorf("operation response bodies exceeded %d bytes", b.initialBytes)
+	}
+	b.remainingBytes -= int64(len(body))
+	return nil
+}
+
+func (b *operationBudget) claimAttachment() error {
+	if b.attachments >= b.maxAttachments {
+		return fmt.Errorf("operation exceeded %d attachment downloads", b.maxAttachments)
+	}
+	b.attachments++
+	return nil
 }
 
 // New validates and snapshots config without performing network I/O. Backend
@@ -159,28 +191,36 @@ func New(config Configuration) (*Server, error) {
 	if config.MaxResponseBytes < 0 {
 		return nil, fmt.Errorf("max response bytes must not be negative")
 	}
+	if config.MaxAttachmentDownloads < 0 {
+		return nil, fmt.Errorf("max attachment downloads must not be negative")
+	}
+	if config.TLSClientConfig != nil && config.CACertPEM != "" {
+		return nil, fmt.Errorf("TLSClientConfig and CACertPEM cannot both be set")
+	}
+	if config.CACertPEM != "" {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(config.CACertPEM)) {
+			return nil, fmt.Errorf("CACertPEM contains no certificates")
+		}
+	}
 	if config.apiPathURI == "" {
 		config.apiPathURI = defaultAPIPathURI
 	}
 	config.apiPathURI = strings.Trim(config.apiPathURI, "/")
-	if config.tokenPathURI == "" {
-		config.tokenPathURI = defaultTokenPathURI
-	}
-	config.tokenPathURI = strings.Trim(config.tokenPathURI, "/")
-
 	baseURL, err := configuredURL(config)
 	if err != nil {
 		return nil, err
 	}
 	apiConfig := delinea.Config{
 		URL:               baseURL,
-		AllowInsecureHTTP: true, // v3.0.2 accepted explicit plaintext ServerURL values.
+		AllowInsecureHTTP: config.AllowInsecureHTTP,
 		Username:          config.Credentials.Username,
 		Password:          config.Credentials.Password,
 		Domain:            config.Credentials.Domain,
 		Timeout:           config.Timeout,
 		AllowedVaultHosts: parseAllowedVaultHosts(config.AllowedVaultHosts),
 		Logger:            slogFor(config.Logger),
+		CACert:            []byte(config.CACertPEM),
 	}
 	if apiConfig.Timeout == 0 {
 		apiConfig.Timeout = defaultHTTPTimeout
@@ -224,8 +264,13 @@ func New(config Configuration) (*Server, error) {
 	} else if responseLimit == math.MaxInt64 {
 		responseLimit--
 	}
+	maxAttachments := config.MaxAttachmentDownloads
+	if maxAttachments == 0 {
+		maxAttachments = defaultMaxAttachments
+	}
 	config.runtime = &serverRuntime{
 		config: apiConfig, logger: logger, responseLimit: responseLimit,
+		timeout: apiConfig.Timeout, maxAttachments: maxAttachments,
 	}
 	return &Server{Configuration: config}, nil
 }
@@ -244,7 +289,32 @@ func configuredURL(config Configuration) (string, error) {
 	if config.Tenant != "" {
 		return delinea.CloudURL(config.Tenant, config.TLD)
 	}
-	return delinea.NormalizeURL(config.ServerURL, true)
+	return delinea.NormalizeURL(config.ServerURL, config.AllowInsecureHTTP)
+}
+
+func (s Server) operationContext() (context.Context, context.CancelFunc) {
+	timeout := defaultHTTPTimeout
+	if s.runtime != nil {
+		timeout = s.runtime.timeout
+	} else if s.Timeout > 0 {
+		timeout = s.Timeout
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+func (s Server) newOperationBudget() *operationBudget {
+	maxAttachments := defaultMaxAttachments
+	if s.runtime != nil {
+		maxAttachments = s.runtime.maxAttachments
+	} else if s.MaxAttachmentDownloads > 0 {
+		maxAttachments = s.MaxAttachmentDownloads
+	}
+	responseLimit := s.maxResponseBytes()
+	return &operationBudget{
+		initialBytes:   responseLimit,
+		remainingBytes: responseLimit,
+		maxAttachments: maxAttachments,
+	}
 }
 
 func (s Server) log() Logger {
@@ -332,7 +402,7 @@ func (s Server) requestPath(resource, path string) string {
 	return base + "/" + strings.TrimPrefix(path, "/")
 }
 
-func (s Server) accessResourceContext(ctx context.Context, method, resource, path string, input interface{}) ([]byte, error) {
+func (s Server) accessResourceContextWithBudget(ctx context.Context, method, resource, path string, input interface{}, budget *operationBudget) ([]byte, error) {
 	if resource != "secrets" && resource != "secret-templates" {
 		return nil, fmt.Errorf("unknown resource")
 	}
@@ -344,10 +414,11 @@ func (s Server) accessResourceContext(ctx context.Context, method, resource, pat
 		}
 		body = bytes.NewReader(data)
 	}
-	return s.do(ctx, delinea.Request{Method: method, Path: s.requestPath(resource, path), Body: body})
+	withholdDiagnostic := input != nil || strings.Contains(path, "?")
+	return s.doWithBudget(ctx, delinea.Request{Method: method, Path: s.requestPath(resource, path), Body: body}, budget, withholdDiagnostic)
 }
 
-func (s Server) searchResourcesContext(ctx context.Context, resource, searchText, field string) ([]byte, error) {
+func (s Server) searchResourcesContextWithBudget(ctx context.Context, resource, searchText, field string, budget *operationBudget) ([]byte, error) {
 	if resource != "secrets" {
 		return nil, fmt.Errorf("unknown resource")
 	}
@@ -365,28 +436,41 @@ func (s Server) searchResourcesContext(ctx context.Context, resource, searchText
 		query.Set("paging.filter.isExactMatch", "true")
 	}
 	path := strings.TrimSuffix(s.requestPath(resource, ""), "/") + "?" + query.Encode()
-	return s.do(ctx, delinea.Request{Method: http.MethodGet, Path: path})
+	return s.doWithBudget(ctx, delinea.Request{Method: http.MethodGet, Path: path}, budget, true)
 }
 
-func (s Server) do(ctx context.Context, request delinea.Request) ([]byte, error) {
+func (s Server) doWithBudget(ctx context.Context, request delinea.Request, budget *operationBudget, withholdDiagnostic bool) ([]byte, error) {
 	client, err := s.apiClient(ctx)
 	if err != nil {
 		return nil, err
 	}
 	request.UseVault = client.Target() == delinea.TargetPlatform
-	limit := s.maxResponseBytes()
+	limit := budget.remainingBytes
 	response, err := client.DoBufferedResponse(ctx, request, limit+1)
 	if err != nil {
 		return nil, err
 	}
-	return handleBufferedResponse(response, limit)
+	body, err := handleBufferedResponse(response, limit, withholdDiagnostic)
+	if err != nil {
+		return nil, err
+	}
+	if err := budget.consume(body); err != nil {
+		return nil, err
+	}
+	return body, nil
 }
 
 func (s Server) uploadFile(secretID int, field SecretField) error {
-	return s.uploadFileContext(context.Background(), secretID, field)
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	return s.uploadFileContext(ctx, secretID, field)
 }
 
 func (s Server) uploadFileContext(ctx context.Context, secretID int, field SecretField) error {
+	return s.uploadFileContextWithBudget(ctx, secretID, field, s.newOperationBudget())
+}
+
+func (s Server) uploadFileContextWithBudget(ctx context.Context, secretID int, field SecretField, budget *operationBudget) error {
 	body := new(bytes.Buffer)
 	writer := multipart.NewWriter(body)
 	filename := field.Filename
@@ -406,12 +490,12 @@ func (s Server) uploadFileContext(ctx context.Context, secretID int, field Secre
 		return err
 	}
 	path := fmt.Sprintf("%d/fields/%s", secretID, url.PathEscape(field.Slug))
-	_, err = s.do(ctx, delinea.Request{
+	_, err = s.doWithBudget(ctx, delinea.Request{
 		Method: http.MethodPut,
 		Path:   s.requestPath("secrets", path),
 		Header: http.Header{"Content-Type": {writer.FormDataContentType()}},
 		Body:   body,
-	})
+	}, budget, true)
 	return err
 }
 
@@ -444,15 +528,24 @@ func (h *legacyLogHandler) Handle(_ context.Context, record slog.Record) error {
 	attrs := slices.Clone(h.attrs)
 	record.Attrs(func(attr slog.Attr) bool { attrs = append(attrs, attr); return true })
 	var b strings.Builder
-	fmt.Fprintf(&b, "[%s] %s", strings.ToUpper(record.Level.String()), record.Message)
+	fmt.Fprintf(&b, "[%s] %s", strings.ToUpper(record.Level.String()), sanitizeLogText(record.Message))
 	for _, group := range h.groups {
-		fmt.Fprintf(&b, " group=%s", group)
+		fmt.Fprintf(&b, " group=%q", sanitizeLogText(group))
 	}
 	for _, attr := range attrs {
-		fmt.Fprintf(&b, " %s=%s", attr.Key, attr.Value.String())
+		fmt.Fprintf(&b, " %q=%q", sanitizeLogText(attr.Key), sanitizeLogText(attr.Value.String()))
 	}
 	h.logger.Print(b.String())
 	return nil
+}
+
+func sanitizeLogText(value string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return '?'
+		}
+		return r
+	}, value)
 }
 
 func (h *legacyLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
