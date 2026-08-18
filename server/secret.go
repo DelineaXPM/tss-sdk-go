@@ -50,14 +50,20 @@ type SshKeyArgs struct {
 
 // Secret gets the secret with id from the Secret Server of the given tenant
 func (s Server) Secret(id int) (*Secret, error) {
-	return s.SecretContext(context.Background(), id)
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	return s.SecretContext(ctx, id)
 }
 
 // SecretContext is Secret with caller-controlled cancellation and deadlines.
 func (s Server) SecretContext(ctx context.Context, id int) (*Secret, error) {
+	return s.secretContext(ctx, id, s.newOperationBudget())
+}
+
+func (s Server) secretContext(ctx context.Context, id int, budget *operationBudget) (*Secret, error) {
 	secret := new(Secret)
 
-	if data, err := s.accessResourceContext(ctx, http.MethodGet, resource, strconv.Itoa(id), nil); err == nil {
+	if data, err := s.accessResourceContextWithBudget(ctx, http.MethodGet, resource, strconv.Itoa(id), nil, budget); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
 			s.log().Printf("[ERROR] parsing response from /%s/%d: %v (%d-byte body not logged)", resource, id, err, len(data))
 			return nil, err
@@ -66,34 +72,45 @@ func (s Server) SecretContext(ctx context.Context, id int) (*Secret, error) {
 		return nil, err
 	}
 
-	// automatically download file attachments and substitute them for the
-	// (dummy) ItemValue, so as to make the process transparent to the caller
-	for index, element := range secret.Fields {
-		if element.IsFile && element.FileAttachmentID != 0 && element.Filename != "" {
-			path := fmt.Sprintf("%d/fields/%s", id, url.PathEscape(element.Slug))
-
-			if data, err := s.accessResourceContext(ctx, http.MethodGet, resource, path, nil); err == nil {
-				secret.Fields[index].ItemValue = string(data)
-			} else {
-				return nil, err
-			}
-		}
+	if err := s.downloadAttachmentsContext(ctx, secret, budget); err != nil {
+		return nil, err
 	}
 
 	return secret, nil
 }
 
+func (s Server) downloadAttachmentsContext(ctx context.Context, secret *Secret, budget *operationBudget) error {
+	for index, element := range secret.Fields {
+		if element.IsFile && element.FileAttachmentID != 0 && element.Filename != "" {
+			if err := budget.claimAttachment(); err != nil {
+				return err
+			}
+			path := fmt.Sprintf("%d/fields/%s", secret.ID, url.PathEscape(element.Slug))
+
+			if data, err := s.accessResourceContextWithBudget(ctx, http.MethodGet, resource, path, nil, budget); err == nil {
+				secret.Fields[index].ItemValue = string(data)
+			} else {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // Secret gets the secret with id from the Secret Server of the given tenant
 func (s Server) Secrets(searchText, field string) ([]Secret, error) {
-	return s.SecretsContext(context.Background(), searchText, field)
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	return s.SecretsContext(ctx, searchText, field)
 }
 
 // SecretsContext is Secrets with caller-controlled cancellation and deadlines.
 func (s Server) SecretsContext(ctx context.Context, searchText, field string) ([]Secret, error) {
+	budget := s.newOperationBudget()
 	searchResult := new(SearchResult)
-	if data, err := s.searchResourcesContext(ctx, resource, searchText, field); err == nil {
+	if data, err := s.searchResourcesContextWithBudget(ctx, resource, searchText, field, budget); err == nil {
 		if err = json.Unmarshal(data, searchResult); err != nil {
-			s.log().Printf("[ERROR] parsing response from /%s/%s: %v (%d-byte body not logged)", resource, searchText, err, len(data))
+			s.log().Printf("[ERROR] parsing secrets search response: %v (%d-byte body not logged)", err, len(data))
 			return nil, err
 		}
 	} else {
@@ -104,7 +121,7 @@ func (s Server) SecretsContext(ctx context.Context, searchText, field string) ([
 	secrets := make([]Secret, len(searchRecords))
 	for i, record := range searchRecords {
 		//secrets returned in search results are not fully populated
-		secret, err := s.SecretContext(ctx, record.ID)
+		secret, err := s.secretContext(ctx, record.ID, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -115,54 +132,51 @@ func (s Server) SecretsContext(ctx context.Context, searchText, field string) ([
 }
 
 func (s Server) SecretByPath(secretPath string) (*Secret, error) {
-	return s.SecretByPathContext(context.Background(), secretPath)
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	return s.SecretByPathContext(ctx, secretPath)
 }
 
 // SecretByPathContext is SecretByPath with caller-controlled cancellation and deadlines.
 func (s Server) SecretByPathContext(ctx context.Context, secretPath string) (*Secret, error) {
+	budget := s.newOperationBudget()
 	secret := new(Secret)
 	// Encode the secret path to be safe for URLs
 	encodedPath := url.QueryEscape(secretPath)
 	queryPath := fmt.Sprintf("0?secretPath=%s", encodedPath)
 
 	// Perform the GET request to the 'secrets' resource with the specified path
-	if data, err := s.accessResourceContext(ctx, http.MethodGet, resource, queryPath, nil); err == nil {
+	if data, err := s.accessResourceContextWithBudget(ctx, http.MethodGet, resource, queryPath, nil, budget); err == nil {
 		if err = json.Unmarshal(data, secret); err != nil {
-			s.log().Printf("[ERROR] parsing response from /%s/%s: %v (%d-byte body not logged)", resource, secretPath, err, len(data))
+			s.log().Printf("[ERROR] parsing secret-by-path response: %v (%d-byte body not logged)", err, len(data))
 			return nil, err
 		}
 	} else {
 		return nil, err
 	}
 
-	// automatically download file attachments and substitute them for the
-	// (dummy) ItemValue, to make the process transparent to the caller
-	for index, element := range secret.Fields {
-		if element.IsFile && element.FileAttachmentID != 0 && element.Filename != "" {
-			path := fmt.Sprintf("%d/fields/%s", secret.ID, url.PathEscape(element.Slug))
-
-			if data, err := s.accessResourceContext(ctx, http.MethodGet, resource, path, nil); err == nil {
-				secret.Fields[index].ItemValue = string(data)
-			} else {
-				return nil, err
-			}
-		}
+	if err := s.downloadAttachmentsContext(ctx, secret, budget); err != nil {
+		return nil, err
 	}
 
 	return secret, nil
 }
 
 func (s Server) CreateSecret(secret Secret) (*Secret, error) {
-	return s.CreateSecretContext(context.Background(), secret)
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	return s.CreateSecretContext(ctx, secret)
 }
 
 // CreateSecretContext is CreateSecret with caller-controlled cancellation and deadlines.
 func (s Server) CreateSecretContext(ctx context.Context, secret Secret) (*Secret, error) {
-	return s.writeSecretContext(ctx, secret, http.MethodPost, "/")
+	return s.writeSecretContext(ctx, secret, http.MethodPost, "/", s.newOperationBudget())
 }
 
 func (s Server) UpdateSecret(secret Secret) (*Secret, error) {
-	return s.UpdateSecretContext(context.Background(), secret)
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	return s.UpdateSecretContext(ctx, secret)
 }
 
 // UpdateSecretContext is UpdateSecret with caller-controlled cancellation and deadlines.
@@ -173,13 +187,13 @@ func (s Server) UpdateSecretContext(ctx context.Context, secret Secret) (*Secret
 		return nil, err
 	}
 	secret.SshKeyArgs = nil
-	return s.writeSecretContext(ctx, secret, http.MethodPut, strconv.Itoa(secret.ID))
+	return s.writeSecretContext(ctx, secret, http.MethodPut, strconv.Itoa(secret.ID), s.newOperationBudget())
 }
 
-func (s Server) writeSecretContext(ctx context.Context, secret Secret, method, path string) (*Secret, error) {
+func (s Server) writeSecretContext(ctx context.Context, secret Secret, method, path string, budget *operationBudget) (*Secret, error) {
 	writtenSecret := new(Secret)
 
-	template, err := s.SecretTemplateContext(ctx, secret.SecretTemplateID)
+	template, err := s.secretTemplateContext(ctx, secret.SecretTemplateID, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +236,7 @@ func (s Server) writeSecretContext(ctx context.Context, secret Secret, method, p
 		secret.Fields = make([]SecretField, 0)
 	}
 
-	if data, err := s.accessResourceContext(ctx, method, resource, path, secret); err == nil {
+	if data, err := s.accessResourceContextWithBudget(ctx, method, resource, path, secret, budget); err == nil {
 		if err = json.Unmarshal(data, writtenSecret); err != nil {
 			s.log().Printf("[ERROR] parsing response from /%s: %v (%d-byte body not logged)", resource, err, len(data))
 			return nil, err
@@ -231,20 +245,22 @@ func (s Server) writeSecretContext(ctx context.Context, secret Secret, method, p
 		return nil, err
 	}
 
-	if err := s.updateFilesContext(ctx, writtenSecret.ID, fileFields); err != nil {
+	if err := s.updateFilesContext(ctx, writtenSecret.ID, fileFields, budget); err != nil {
 		return nil, err
 	}
 
-	return s.SecretContext(ctx, writtenSecret.ID)
+	return s.secretContext(ctx, writtenSecret.ID, budget)
 }
 
 func (s Server) DeleteSecret(id int) error {
-	return s.DeleteSecretContext(context.Background(), id)
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	return s.DeleteSecretContext(ctx, id)
 }
 
 // DeleteSecretContext is DeleteSecret with caller-controlled cancellation and deadlines.
 func (s Server) DeleteSecretContext(ctx context.Context, id int) error {
-	_, err := s.accessResourceContext(ctx, http.MethodDelete, resource, strconv.Itoa(id), nil)
+	_, err := s.accessResourceContextWithBudget(ctx, http.MethodDelete, resource, strconv.Itoa(id), nil, s.newOperationBudget())
 	return err
 }
 
@@ -268,7 +284,7 @@ func (s Secret) FieldById(fieldId int) (string, bool) {
 	return "", false
 }
 
-func (s Server) updateFilesContext(ctx context.Context, secretId int, fileFields []SecretField) error {
+func (s Server) updateFilesContext(ctx context.Context, secretId int, fileFields []SecretField, budget *operationBudget) error {
 	type fieldMod struct {
 		Slug  string
 		Dirty bool
@@ -289,11 +305,11 @@ func (s Server) updateFilesContext(ctx context.Context, secretId int, fileFields
 		if element.ItemValue == "" {
 			path = fmt.Sprintf("%d/general", secretId)
 			input = secretPatch{Data: fieldMods{SecretFields: []fieldMod{{Slug: element.Slug, Dirty: true, Value: nil}}}}
-			if _, err := s.accessResourceContext(ctx, http.MethodPatch, resource, path, input); err != nil {
+			if _, err := s.accessResourceContextWithBudget(ctx, http.MethodPatch, resource, path, input, budget); err != nil {
 				return err
 			}
 		} else {
-			if err := s.uploadFileContext(ctx, secretId, element); err != nil {
+			if err := s.uploadFileContextWithBudget(ctx, secretId, element, budget); err != nil {
 				return err
 			}
 		}

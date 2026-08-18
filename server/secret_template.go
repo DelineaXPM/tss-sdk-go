@@ -27,14 +27,20 @@ type SecretTemplateField struct {
 
 // SecretTemplate gets the secret template with id from the Secret Server of the given tenant
 func (s Server) SecretTemplate(id int) (*SecretTemplate, error) {
-	return s.SecretTemplateContext(context.Background(), id)
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	return s.SecretTemplateContext(ctx, id)
 }
 
 // SecretTemplateContext is SecretTemplate with caller-controlled cancellation and deadlines.
 func (s Server) SecretTemplateContext(ctx context.Context, id int) (*SecretTemplate, error) {
+	return s.secretTemplateContext(ctx, id, s.newOperationBudget())
+}
+
+func (s Server) secretTemplateContext(ctx context.Context, id int, budget *operationBudget) (*SecretTemplate, error) {
 	secretTemplate := new(SecretTemplate)
 
-	if data, err := s.accessResourceContext(ctx, http.MethodGet, templateResource, strconv.Itoa(id), nil); err == nil {
+	if data, err := s.accessResourceContextWithBudget(ctx, http.MethodGet, templateResource, strconv.Itoa(id), nil, budget); err == nil {
 		if err = json.Unmarshal(data, secretTemplate); err != nil {
 			s.log().Printf("[ERROR] parsing response from /%s/%d: %v (%d-byte body not logged)", templateResource, id, err, len(data))
 			return nil, err
@@ -50,7 +56,9 @@ func (s Server) SecretTemplateContext(ctx context.Context, id int) (*SecretTempl
 // template. The password adheres to the password requirements associated with the field. NOTE: this should only be
 // used with fields whose IsPassword property is true.
 func (s Server) GeneratePassword(slug string, template *SecretTemplate) (string, error) {
-	return s.GeneratePasswordContext(context.Background(), slug, template)
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	return s.GeneratePasswordContext(ctx, slug, template)
 }
 
 // GeneratePasswordContext is GeneratePassword with caller-controlled cancellation and deadlines.
@@ -66,7 +74,7 @@ func (s Server) GeneratePasswordContext(ctx context.Context, slug string, templa
 	}
 	path := fmt.Sprintf("generate-password/%d", fieldId)
 
-	if data, err := s.accessResourceContext(ctx, http.MethodPost, templateResource, path, nil); err == nil {
+	if data, err := s.accessResourceContextWithBudget(ctx, http.MethodPost, templateResource, path, nil, s.newOperationBudget()); err == nil {
 		var password *string
 		if err := json.Unmarshal(data, &password); err != nil {
 			return "", fmt.Errorf("parsing generate-password response: %w", err)
