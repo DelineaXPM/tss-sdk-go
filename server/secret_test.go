@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -207,9 +208,10 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	refSecret.SshKeyArgs = &SshKeyArgs{}
 	refSecret.SshKeyArgs.GenerateSshKeys = true
 	refSecret.SshKeyArgs.GeneratePassphrase = true
-	refSecret.Fields = make([]SecretField, 7)
 
-	// Make a best-effort attempt to find the fields related to SSH key generation
+	// Locate the fields related to SSH key generation. Public key, private key,
+	// and passphrase fields are mandatory because this test claims to verify all
+	// three generated values; the remaining fields are template-dependent.
 	refSecretTemplate, err := tss.SecretTemplate(templateId)
 	if err != nil {
 		t.Fatal("calling server.SecretTemplate:", err)
@@ -223,53 +225,52 @@ func SecretCRUDForSSHTemplate(t *testing.T, tss *Server) {
 	passwordRegex := regexp.MustCompile("(?i)password")
 	machineRegex := regexp.MustCompile("(?i)machine")
 	hostRegex := regexp.MustCompile("(?i)host")
-	idx := 0
 	for _, field := range refSecretTemplate.Fields {
 		if field.IsFile {
 			if publicRegex.MatchString(field.FieldSlugName) {
 				publicKeyFieldId = field.SecretTemplateFieldID
-				refSecret.Fields[idx].FieldID = publicKeyFieldId
-				refSecret.Fields[idx].Filename = "" // Let the server generate the name
+				refSecret.Fields = append(refSecret.Fields, SecretField{FieldID: publicKeyFieldId})
 				t.Logf("Found a public key field with ID '%d'", publicKeyFieldId)
-				idx++
 			} else if privateRegex.MatchString(field.FieldSlugName) {
 				privateKeyFieldId = field.SecretTemplateFieldID
-				refSecret.Fields[idx].FieldID = privateKeyFieldId
-				refSecret.Fields[idx].Filename = "My Private Key.pem"
+				refSecret.Fields = append(refSecret.Fields, SecretField{FieldID: privateKeyFieldId, Filename: "My Private Key.pem"})
 				t.Logf("Found a private key field with ID '%d'", privateKeyFieldId)
-				idx++
 			}
 		} else if field.IsPassword {
 			if passphraseRegex.MatchString(field.FieldSlugName) {
 				passphraseFieldId = field.SecretTemplateFieldID
-				refSecret.Fields[idx].FieldID = passphraseFieldId
-				refSecret.Fields[idx].ItemValue = "" // Let the server generate the value
+				refSecret.Fields = append(refSecret.Fields, SecretField{FieldID: passphraseFieldId})
 				t.Logf("Found a passphrase field with ID '%d'", passphraseFieldId)
-				idx++
 			} else if passwordRegex.MatchString(field.FieldSlugName) {
 				passwordFieldId = field.SecretTemplateFieldID
-				refSecret.Fields[idx].FieldID = passwordFieldId
-				refSecret.Fields[idx].ItemValue = password
+				refSecret.Fields = append(refSecret.Fields, SecretField{FieldID: passwordFieldId, ItemValue: password})
 				t.Logf("Found a password field with ID '%d'", passwordFieldId)
-				idx++
 			}
 		} else {
 			if userNameRegex.MatchString(field.FieldSlugName) {
 				userNameFieldId = field.SecretTemplateFieldID
-				refSecret.Fields[idx].FieldID = userNameFieldId
-				refSecret.Fields[idx].ItemValue = userName
+				refSecret.Fields = append(refSecret.Fields, SecretField{FieldID: userNameFieldId, ItemValue: userName})
 				t.Logf("Found a username field with ID '%d'", userNameFieldId)
-				idx++
 			} else if machineRegex.MatchString(field.FieldSlugName) || hostRegex.MatchString(field.FieldSlugName) {
 				machineNameFieldId = field.SecretTemplateFieldID
-				refSecret.Fields[idx].FieldID = machineNameFieldId
-				refSecret.Fields[idx].ItemValue = machine
+				refSecret.Fields = append(refSecret.Fields, SecretField{FieldID: machineNameFieldId, ItemValue: machine})
 				t.Logf("Found a machine name field with ID '%d'", machineNameFieldId)
-				idx++
 			}
 		}
 	}
-	refSecret.Fields = refSecret.Fields[0:idx]
+	missing := make([]string, 0, 3)
+	if publicKeyFieldId <= 0 {
+		missing = append(missing, "public key")
+	}
+	if privateKeyFieldId <= 0 {
+		missing = append(missing, "private key")
+	}
+	if passphraseFieldId <= 0 {
+		missing = append(missing, "passphrase")
+	}
+	if len(missing) != 0 {
+		t.Fatalf("SSH template %d does not expose positive IDs for required %s fields", templateId, strings.Join(missing, ", "))
+	}
 
 	// Test creation of a new secret
 	sc, err := tss.CreateSecret(*refSecret)
@@ -549,6 +550,7 @@ func Search(t *testing.T, tss *Server) {
 
 	searchText := requireEnv(t, "TSS_SEARCH_TEXT")
 	searchField := requireEnv(t, "TSS_SEARCH_FIELD")
+	expectedID := requireIntEnv(t, "TSS_SECRET_ID")
 
 	s, err := tss.Secrets(searchText, searchField)
 
@@ -560,7 +562,11 @@ func Search(t *testing.T, tss *Server) {
 		t.Fatal("secret data is nil or empty")
 	}
 
-	if _, ok := s[0].Field("password"); !ok {
+	fixture := requireSearchFixture(t, s, expectedID)
+	if value, ok := fixture.Field(searchField); !ok || value != searchText {
+		t.Errorf("fixture field %q did not equal the configured search text", searchField)
+	}
+	if _, ok := fixture.Field("password"); !ok {
 		t.Error("no password field")
 	}
 }
@@ -571,8 +577,10 @@ func TestSearchWithoutField(t *testing.T) {
 }
 
 func SearchWithoutField(t *testing.T, tss *Server) {
-
-	s, err := tss.Secrets(requireEnv(t, "TSS_SEARCH_TEXT"), "")
+	searchText := requireEnv(t, "TSS_SEARCH_TEXT")
+	searchField := requireEnv(t, "TSS_SEARCH_FIELD")
+	expectedID := requireIntEnv(t, "TSS_SECRET_ID")
+	s, err := tss.Secrets(searchText, "")
 
 	if err != nil {
 		t.Fatal("calling server.Secret:", err)
@@ -583,7 +591,11 @@ func SearchWithoutField(t *testing.T, tss *Server) {
 		t.Fatal("secret data is nil or empty")
 	}
 
-	if _, ok := s[0].Field("password"); !ok {
+	fixture := requireSearchFixture(t, s, expectedID)
+	if value, ok := fixture.Field(searchField); !ok || value != searchText {
+		t.Errorf("fixture field %q did not equal the configured search text", searchField)
+	}
+	if _, ok := fixture.Field("password"); !ok {
 		t.Error("no password field")
 	}
 }
@@ -596,6 +608,7 @@ func TestSecretByPath(t *testing.T) {
 func GetSecretByPath(t *testing.T, tss *Server) {
 	// requireEnv skips or fails when the variable is unset, so secretPath is non-empty.
 	secretPath := requireEnv(t, "TSS_SECRET_PATH")
+	expectedID := requireIntEnv(t, "TSS_SECRET_ID")
 
 	secret, err := tss.SecretByPath(secretPath)
 	if err != nil {
@@ -614,10 +627,24 @@ func GetSecretByPath(t *testing.T, tss *Server) {
 	if secret.ID == 0 {
 		t.Error("Secret ID is zero")
 	}
+	if secret.ID != expectedID {
+		t.Errorf("SecretByPath returned ID %d, want configured fixture ID %d", secret.ID, expectedID)
+	}
 
 	if len(secret.Fields) == 0 {
 		t.Error("Secret fields are empty")
 	}
+}
+
+func requireSearchFixture(t *testing.T, secrets []Secret, expectedID int) *Secret {
+	t.Helper()
+	for i := range secrets {
+		if secrets[i].ID == expectedID {
+			return &secrets[i]
+		}
+	}
+	t.Fatalf("search did not return configured fixture ID %d", expectedID)
+	return nil
 }
 
 // validate reports whether found equals expected, naming both on failure. It formats

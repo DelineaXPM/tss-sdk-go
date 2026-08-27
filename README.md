@@ -12,12 +12,13 @@ typed Secret Server models and operations.
 
 ## Configure
 
-The API requires a `Configuration` object containing a `Username`, `Password`
-and either a `Tenant` for Secret Server Cloud or a `ServerURL` of Secret Server/Platform:
+The API requires a `Configuration` containing either username/password
+credentials for Secret Server or Platform, or a Secret Server bearer token. Set
+either a `Tenant` for Secret Server Cloud or a complete `ServerURL`:
 
 ```golang
 type UserCredential struct {
-    Username, Password string
+    Domain, Username, Password, Token string
 }
 
 type Configuration struct {
@@ -101,7 +102,7 @@ tss, err := server.New(server.Configuration{
         Password: os.Getenv("TSS_PASSWORD"),
     },
     // Expecting either the tenant or URL to be set
-    Tenant:    os.Getenv("TSS_API_TENANT"),
+    Tenant:    os.Getenv("TSS_TENANT"),
     ServerURL: os.Getenv("TSS_SERVER_URL"),
 })
 if err != nil {
@@ -144,10 +145,16 @@ Every network operation also has a `Context` variant, such as
 `SecretContext`, `CreateSecretContext`, and `GeneratePasswordContext`, for
 caller-controlled cancellation and deadlines.
 
+Reuse a `Server` when practical. Before permanently discarding an initialized
+server, call `CloseIdleConnections` to promptly release connections retained by
+its underlying HTTP transport. The server remains usable after that call. If the
+process replaced `http.DefaultTransport`, that transport may be shared and the
+call closes its shared idle pool.
+
 Get a Secret by Path:
 
 ```golang
-secretPath := "/Secret-Folder/Secret-Name"
+secretPath := `\Secret-Folder\Secret-Name`
 secret, err := tss.SecretByPath(secretPath)
 if err != nil {
     log.Fatalf("Failed to retrieve secret by path: %v", err)
@@ -261,21 +268,21 @@ because credentials happen to be present in the environment.
 The SDK pins the public immutable `delinea-common` v1.0.0 module without a
 `replace` directive or private-module authentication.
 
-Live tenant credentials belong only in a required-review `live-tests`
-environment restricted to `main`. The ordinary test workflow is
-credential-free. A separate scheduled/manual live workflow remains disabled
-unless the repository variable `TSS_LIVE_CI_ENABLED` is exactly `true`; enable
-it only after the environment, its isolated identities, and all fixtures are
-installed. Repository
-administrators must also protect `main`, restrict direct creation and movement of
-`v*` tags to the release workflow, require review for the `release` environment,
-and disallow protection-rule bypass before enabling hosted live tests or releases.
-Releases are created by manually dispatching the release workflow from `main`;
-it verifies the public dependency, offline analysis, and complete live tenant
-battery before it creates the requested tag. Module replacements are forbidden
-for releases.
+Live tenant credentials belong only in a `live-tests` environment restricted to
+`main`; the ordinary pull-request workflow is credential-free. The scheduled and
+manual live workflow uses strict mode, so missing credentials or fixtures fail
+instead of silently removing coverage. Repository administrators must protect
+`main`, restrict direct creation and movement of `v*` tags to the release workflow,
+and configure the main-only `release` environment and deploy key before enabling
+releases. The manually dispatched release workflow requires the requested version
+to match the unreleased changelog heading, verifies the public dependency, reruns
+the complete offline and live suites, confirms `main` has not moved, then creates
+an immutable annotated tag and a source-only GitHub release. Module replacements
+are forbidden for releases. See [RELEASING.md](RELEASING.md).
 
-The tests populate a `Configuration` from JSON:
+Local tests may populate a `Configuration` from repository-root
+`test_config.json` for Secret Server or `test_config_platform.json` for
+Platform:
 
 ```golang
 config := new(Configuration)
@@ -302,7 +309,10 @@ if err != nil {
 }
 ```
 
-The necessary configuration may also be configured from environment variables:
+The necessary configuration may instead come from environment variables. A
+target configured by both its JSON file and any of its environment variables is
+rejected so a stale local file cannot redirect destructive tests to another
+tenant. Both JSON filenames are ignored by Git and must never be committed.
 
 | Env Var Name   | Description                                                                                                                              |
 |----------------|------------------------------------------------------------------------------------------------------------------------------------------|
@@ -312,10 +322,10 @@ The necessary configuration may also be configured from environment variables:
 | TSS_SERVER_URL | URL for secret servers not hosted in the cloud, eg: https://delinea.mycompany.com/SecretServer or platform URL                                             |
 | TSS_PLATFORM_USERNAME | The OAuth client ID for the Platform service user                              |
 | TSS_PLATFORM_PASSWORD | The OAuth client secret for the Platform service user                          |
-| TSS_PLATFORM_URL | URL for Platform, eg: https://delinea.secureplatform.com/                                            |
+| TSS_PLATFORM_URL | URL for Platform, eg: https://delinea.secureplatform.io/                                             |
 
 ### Test #1 - Read Secret Password
-Reads the secret with ID `1` or the ID passed in the `TSS_SECRET_ID` environment variable
+Reads the secret with the ID passed in the `TSS_SECRET_ID` environment variable
 and extracts the `password` field from it.
 
 ### Test #2 - Perform Secret CRUD
@@ -348,13 +358,16 @@ Searches for secrets with a field value using the values passed in the environme
 |-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
 | TSS_SEARCH_FIELD            | The secret field to be searched                                                                                                   |
 | TSS_SEARCH_TEXT             | The text to search                                                                                                                |
+| TSS_SECRET_ID               | The numeric ID of the fixture that must appear in the search results                                                              |
 
 ### Test #5 - Perform search for password secret
 Searches for secrets containing text using the values passed in the environment variables below.
 
 | Env Var Name                | Description                                                                                                                       |
 |-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| TSS_SEARCH_FIELD            | The fixture field whose exact value is validated after the text search                                                            |
 | TSS_SEARCH_TEXT             | The text to search                                                                                                                |
+| TSS_SECRET_ID               | The numeric ID of the fixture that must appear in the search results                                                              |
 
 ### Test #6 - Password Generation
 Retrieves the template indicated in the environment variable below, iterates its fields, and
@@ -365,5 +378,5 @@ validates that we can generate a password value for every field that is a passwo
 | TSS_TEMPLATE_ID | The numeric ID of the template that defines the secret's fields               |
 
 ### Test #7 - Read Secret By Secret-Path
-Reads the secret with Secret-Path passed in the `TSS_SECRET_PATH` environment variable
-and extracts the Secret fields from it.
+Reads the secret at `TSS_SECRET_PATH`, requires its ID to equal `TSS_SECRET_ID`,
+and extracts its fields.

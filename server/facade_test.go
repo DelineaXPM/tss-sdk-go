@@ -22,7 +22,21 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	delinea "github.com/DelineaXPM/delinea-common/api"
 )
+
+type closeTrackingTransport struct {
+	closeCalls atomic.Int32
+}
+
+func (*closeTrackingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("unexpected request")
+}
+
+func (t *closeTrackingTransport) CloseIdleConnections() {
+	t.closeCalls.Add(1)
+}
 
 func writeGrant(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
@@ -75,6 +89,33 @@ func TestFacadeSecretServerInitializesLazilyAndReusesToken(t *testing.T) {
 	}
 	if probes.Load() != 1 || grants.Load() != 1 || reads.Load() != 2 {
 		t.Fatalf("probes=%d grants=%d reads=%d, want 1,1,2", probes.Load(), grants.Load(), reads.Load())
+	}
+}
+
+func TestFacadeCloseIdleConnectionsDelegatesToInitializedClient(t *testing.T) {
+	transport := new(closeTrackingTransport)
+	client, err := delinea.New(delinea.Config{
+		URL:       "https://example.com",
+		Token:     "facade-test-token",
+		Target:    delinea.TargetSecretServer,
+		Transport: transport,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{Configuration: Configuration{runtime: &serverRuntime{client: client}}}
+	server.CloseIdleConnections()
+	if got := transport.closeCalls.Load(); got != 1 {
+		t.Fatalf("CloseIdleConnections delegated %d times, want 1", got)
+	}
+
+	// A server remains usable after closing idle connections, and an
+	// uninitialized value has nothing to close.
+	server.CloseIdleConnections()
+	var uninitialized Server
+	uninitialized.CloseIdleConnections()
+	if got := transport.closeCalls.Load(); got != 2 {
+		t.Fatalf("second CloseIdleConnections delegated %d times, want 2", got)
 	}
 }
 

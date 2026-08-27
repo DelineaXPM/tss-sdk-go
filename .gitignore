@@ -28,5 +28,6 @@
 .vscode
 .idea
 /_local/
-test_config.json
+/test_config.json
+/test_config_platform.json
 .DS_Store

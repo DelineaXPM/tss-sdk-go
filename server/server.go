@@ -425,6 +425,23 @@ func (s Server) apiClient(ctx context.Context) (*delinea.Client, error) {
 	}
 }
 
+// CloseIdleConnections closes connections held idle by this Server's underlying
+// HTTP transport. It does not interrupt active requests, and the Server remains
+// usable. Calling it before the first network operation is a no-op. If the
+// process replaced http.DefaultTransport, its idle pool may be shared with other
+// clients and is closed as well.
+func (s Server) CloseIdleConnections() {
+	if s.runtime == nil {
+		return
+	}
+	s.runtime.mu.Lock()
+	client := s.runtime.client
+	s.runtime.mu.Unlock()
+	if client != nil {
+		client.CloseIdleConnections()
+	}
+}
+
 func (rt *serverRuntime) runInitialization(ctx context.Context, flight *clientInitialization) (client *delinea.Client, err error) {
 	completed := false
 	publish := func(client *delinea.Client, err error, leaderLocal bool) {

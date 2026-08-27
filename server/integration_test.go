@@ -2,7 +2,10 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,7 +41,7 @@ func integrationTargets() []integrationTarget {
 			envPrefix:  "TSS_PLATFORM_",
 			requireVar: "TSS_REQUIRE_PLATFORM",
 			configFile: "../test_config_platform.json",
-			envVars:    []string{"TSS_PLATFORM_USERNAME", "TSS_PLATFORM_PASSWORD", "TSS_PLATFORM_URL"},
+			envVars:    []string{"TSS_PLATFORM_USERNAME", "TSS_PLATFORM_PASSWORD", "TSS_PLATFORM_URL", "TSS_PLATFORM_ALLOWED_VAULT_HOSTS"},
 			envConfig: func() Configuration {
 				return Configuration{
 					Credentials:       UserCredential{Username: os.Getenv("TSS_PLATFORM_USERNAME"), Password: os.Getenv("TSS_PLATFORM_PASSWORD")},
@@ -54,6 +57,10 @@ func (target integrationTarget) configured() bool {
 	if _, err := os.Stat(target.configFile); err == nil {
 		return true
 	}
+	return target.environmentConfigured()
+}
+
+func (target integrationTarget) environmentConfigured() bool {
 	for _, name := range target.envVars {
 		if os.Getenv(name) != "" {
 			return true
@@ -66,20 +73,63 @@ func (target integrationTarget) required() bool {
 	return os.Getenv(integrationOptIn) != "" || os.Getenv(target.requireVar) != ""
 }
 
-func (target integrationTarget) server(t *testing.T) *Server {
-	t.Helper()
+func (target integrationTarget) configuration() (Configuration, error) {
 	config := target.envConfig()
-	if data, err := os.ReadFile(target.configFile); err == nil {
+	data, err := os.ReadFile(target.configFile)
+	switch {
+	case err == nil && target.environmentConfigured():
+		return Configuration{}, fmt.Errorf("%s integration is configured by both environment variables and %s; choose one source", target.name, target.configFile)
+	case err == nil:
 		config = Configuration{}
 		if err := json.Unmarshal(data, &config); err != nil {
-			t.Fatalf("parsing %s: %v", target.configFile, err)
+			return Configuration{}, fmt.Errorf("parsing %s: %w", target.configFile, err)
 		}
+	case !errors.Is(err, os.ErrNotExist):
+		return Configuration{}, fmt.Errorf("reading %s: %w", target.configFile, err)
+	}
+	return config, nil
+}
+
+func (target integrationTarget) server(t *testing.T) *Server {
+	t.Helper()
+	config, err := target.configuration()
+	if err != nil {
+		t.Fatal(err)
 	}
 	server, err := New(config)
 	if err != nil {
 		t.Fatalf("configuring %s: %v", target.name, err)
 	}
 	return server
+}
+
+func TestIntegrationConfigurationRejectsAmbiguousSources(t *testing.T) {
+	const envName = "TSS_TEST_AMBIGUOUS_CONFIG"
+	t.Setenv(envName, "configured")
+	configFile := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configFile, []byte(`{"ServerURL":"https://example.com"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := integrationTarget{
+		name:       "TestTarget",
+		configFile: configFile,
+		envVars:    []string{envName},
+		envConfig:  func() Configuration { return Configuration{} },
+	}
+	if _, err := target.configuration(); err == nil || !strings.Contains(err.Error(), "both environment variables") {
+		t.Fatalf("configuration error = %v, want ambiguous-source error", err)
+	}
+}
+
+func TestPlatformVaultTrustCountsAsEnvironmentConfiguration(t *testing.T) {
+	target := integrationTargets()[1]
+	for _, name := range target.envVars {
+		t.Setenv(name, "")
+	}
+	t.Setenv("TSS_PLATFORM_ALLOWED_VAULT_HOSTS", "vault.example")
+	if !target.environmentConfigured() {
+		t.Fatal("Platform vault trust did not count as environment configuration")
+	}
 }
 
 func runBattery(t *testing.T, body func(*testing.T, *Server)) {

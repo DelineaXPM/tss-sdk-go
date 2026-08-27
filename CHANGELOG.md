@@ -25,6 +25,8 @@ retaining the v3 typed Secret Server API.
 
 - Context variants for every network operation.
 - `HTTPError` and `PartialWriteError` for structured failure handling.
+- `Server.CloseIdleConnections` for promptly releasing an initialized server's
+  underlying idle HTTP connections.
 - `CACertPEM`, `AllowedVaultHosts`, retry controls, `MaxResponseBytes`,
   `MaxRequestBytes`, `MaxAttachmentDownloads`, and `MaxSearchResults`.
 
@@ -49,12 +51,17 @@ retaining the v3 typed Secret Server API.
 - Direct secret and template reads reject mismatched response IDs before any
   attachment or write follow-up; path reads, delete inputs, and generated-password
   template field IDs must be positive.
+- `SecretTemplate.GetField` returns a pointer to the matching field in the
+  template, so edits through it now update that template instead of a loop copy.
 
 ### Release requirements
 
-The manually dispatched release workflow verifies a stable v3 tag name, rejects
-prerelease, pseudo-version, or pre-v1 `delinea-common` dependencies, rejects
-module replacements and unreviewed transitive modules, runs the offline and required live batteries, and
-only then creates the tag from `main`. Publishing v3.1.0 still requires the
-reviewed engine commit to be publicly available at an immutable stable v1 tag and
-the compatibility decisions in the release plan to be approved.
+The manually dispatched release workflow requires the requested stable v3 version
+to match this unreleased changelog entry; rejects prerelease, pseudo-version, or
+pre-v1 `delinea-common` dependencies, module replacements, and unreviewed
+transitive modules; reruns the complete offline and required live batteries;
+confirms `main` has not moved; and only then creates an annotated tag and
+source-only GitHub release whose body begins with the reviewed customer-facing
+content above and continues with GitHub's generated change notes. Publishing
+v3.1.0 still requires the compatibility decisions in the release plan to be
+approved.
