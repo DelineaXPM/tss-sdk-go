@@ -22,6 +22,7 @@ jobs:
   validate:
     name: Validate release request
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -49,14 +50,15 @@ jobs:
     name: Offline release verification
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: '1.26.6'
-          check-latest: true
+          go-version-file: go.mod
+          cache: false
       - name: Require the public stable delinea-common API
         run: |
           replacements="$(go mod edit -json | jq '.Replace | length')"
@@ -85,68 +87,64 @@ jobs:
       - run: go build -v ./...
       - run: go test -race ./...
       - run: go vet ./...
-      - run: |
-          go install honnef.co/go/tools/cmd/staticcheck@2026.1
-          staticcheck ./...
-      - run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
-          govulncheck ./...
-      - run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
-          gosec -quiet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+      - run: go run github.com/securego/gosec/v2/cmd/gosec@v2.22.10 -quiet ./...
 
   integration:
     name: Required live Secret Server and Platform battery
     needs: validate
     runs-on: ubuntu-latest
     environment: live-tests
+    timeout-minutes: 30
     concurrency:
       group: live-tenant-battery
       cancel-in-progress: false
-    env:
-      TSS_REQUIRE_SECRET_SERVER: '1'
-      TSS_REQUIRE_PLATFORM: '1'
-      TSS_TENANT: ${{ secrets.TSS_TENANT }}
-      TSS_SERVER_URL: ${{ secrets.TSS_SERVER_URL }}
-      TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
-      TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
-      TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
-      TSS_SECRET_PATH: ${{ secrets.TSS_SECRET_PATH }}
-      TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
-      TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
-      TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
-      TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
-      TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
-      TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
-      TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
-      TSS_PLATFORM_USERNAME: ${{ secrets.TSS_PLATFORM_USERNAME }}
-      TSS_PLATFORM_PASSWORD: ${{ secrets.TSS_PLATFORM_PASSWORD }}
-      TSS_PLATFORM_URL: ${{ secrets.TSS_PLATFORM_URL }}
-      TSS_PLATFORM_ALLOWED_VAULT_HOSTS: ${{ secrets.TSS_PLATFORM_ALLOWED_VAULT_HOSTS }}
-      TSS_PLATFORM_SECRET_ID: ${{ secrets.TSS_PLATFORM_SECRET_ID }}
-      TSS_PLATFORM_SECRET_PATH: ${{ secrets.TSS_PLATFORM_SECRET_PATH }}
-      TSS_PLATFORM_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_TEMPLATE_ID }}
-      TSS_PLATFORM_FOLDER_ID: ${{ secrets.TSS_PLATFORM_FOLDER_ID }}
-      TSS_PLATFORM_SITE_ID: ${{ secrets.TSS_PLATFORM_SITE_ID }}
-      TSS_PLATFORM_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_SSH_KEY_TEMPLATE_ID }}
-      TSS_PLATFORM_TEST_PASSWORD: ${{ secrets.TSS_PLATFORM_TEST_PASSWORD }}
-      TSS_PLATFORM_SEARCH_FIELD: ${{ secrets.TSS_PLATFORM_SEARCH_FIELD }}
-      TSS_PLATFORM_SEARCH_TEXT: ${{ secrets.TSS_PLATFORM_SEARCH_TEXT }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: '1.26.6'
-          check-latest: true
+          go-version-file: go.mod
+          cache: false
       - run: go mod download
       - run: go mod verify
-      - run: go test -race -v ./server
+      - name: run strict live battery
+        env:
+          TSS_REQUIRE_SECRET_SERVER: '1'
+          TSS_REQUIRE_PLATFORM: '1'
+          TSS_SERVER_URL: ${{ vars.TSS_SERVER_URL }}
+          TSS_USERNAME: ${{ vars.TSS_USERNAME }}
+          TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
+          TSS_SECRET_ID: ${{ vars.TSS_SECRET_ID }}
+          TSS_SECRET_PATH: ${{ vars.TSS_SECRET_PATH }}
+          TSS_TEMPLATE_ID: ${{ vars.TSS_TEMPLATE_ID }}
+          TSS_FOLDER_ID: ${{ vars.TSS_FOLDER_ID }}
+          TSS_SITE_ID: ${{ vars.TSS_SITE_ID }}
+          TSS_SSH_KEY_TEMPLATE_ID: ${{ vars.TSS_SSH_KEY_TEMPLATE_ID }}
+          TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
+          TSS_SEARCH_FIELD: ${{ vars.TSS_SEARCH_FIELD }}
+          TSS_SEARCH_TEXT: ${{ vars.TSS_SEARCH_TEXT }}
+          TSS_PLATFORM_USERNAME: ${{ vars.TSS_PLATFORM_CLIENT_ID }}
+          TSS_PLATFORM_PASSWORD: ${{ secrets.TSS_PLATFORM_CLIENT_SECRET }}
+          TSS_PLATFORM_URL: ${{ vars.TSS_PLATFORM_URL }}
+          TSS_PLATFORM_ALLOWED_VAULT_HOSTS: ${{ vars.TSS_PLATFORM_ALLOWED_VAULT_HOSTS }}
+          TSS_PLATFORM_SECRET_ID: ${{ vars.TSS_PLATFORM_SECRET_ID }}
+          TSS_PLATFORM_SECRET_PATH: ${{ vars.TSS_PLATFORM_SECRET_PATH }}
+          TSS_PLATFORM_TEMPLATE_ID: ${{ vars.TSS_PLATFORM_TEMPLATE_ID }}
+          TSS_PLATFORM_FOLDER_ID: ${{ vars.TSS_PLATFORM_FOLDER_ID }}
+          TSS_PLATFORM_SITE_ID: ${{ vars.TSS_PLATFORM_SITE_ID }}
+          TSS_PLATFORM_SSH_KEY_TEMPLATE_ID: ${{ vars.TSS_PLATFORM_SSH_KEY_TEMPLATE_ID }}
+          TSS_PLATFORM_TEST_PASSWORD: ${{ secrets.TSS_PLATFORM_TEST_PASSWORD }}
+          TSS_PLATFORM_SEARCH_FIELD: ${{ vars.TSS_PLATFORM_SEARCH_FIELD }}
+          TSS_PLATFORM_SEARCH_TEXT: ${{ vars.TSS_PLATFORM_SEARCH_TEXT }}
+        run: go test -count=1 -race -v ./server
 
   tag:
     name: Create verified release tag
     needs: [verify, integration]
     runs-on: ubuntu-latest
     environment: release
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

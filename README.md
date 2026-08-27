@@ -262,8 +262,11 @@ The SDK pins the public immutable `delinea-common` v1.0.0 module without a
 `replace` directive or private-module authentication.
 
 Live tenant credentials belong only in a required-review `live-tests`
-environment restricted to `main`. The ordinary test workflow never runs its live
-job for pull requests, development-branch pushes, or tags. Repository
+environment restricted to `main`. The ordinary test workflow is
+credential-free. A separate scheduled/manual live workflow remains disabled
+unless the repository variable `TSS_LIVE_CI_ENABLED` is exactly `true`; enable
+it only after the environment, its isolated identities, and all fixtures are
+installed. Repository
 administrators must also protect `main`, restrict direct creation and movement of
 `v*` tags to the release workflow, require review for the `release` environment,
 and disallow protection-rule bypass before enabling hosted live tests or releases.
@@ -307,8 +310,8 @@ The necessary configuration may also be configured from environment variables:
 | TSS_PASSWORD   | The password for the user of Secret Server                                                                                                           |
 | TSS_TENANT     | Name for tenants hosted in the Secret Server Cloud. This is prepended to the *.secretservercloud.com domain to determine the server URL. |
 | TSS_SERVER_URL | URL for secret servers not hosted in the cloud, eg: https://delinea.mycompany.com/SecretServer or platform URL                                             |
-| TSS_PLATFORM_USERNAME | The user name for the Platform user                                             |
-| TSS_PLATFORM_PASSWORD | The password for the Platform user                                             |
+| TSS_PLATFORM_USERNAME | The OAuth client ID for the Platform service user                              |
+| TSS_PLATFORM_PASSWORD | The OAuth client secret for the Platform service user                          |
 | TSS_PLATFORM_URL | URL for Platform, eg: https://delinea.secureplatform.com/                                            |
 
 ### Test #1 - Read Secret Password
