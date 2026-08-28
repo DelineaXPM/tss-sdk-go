@@ -19,8 +19,8 @@ other build artifacts to GitHub releases.
 5. Verify the tag from a clean module cache before announcing the release.
 
 The workflow rejects prerelease syntax, a version that does not match the pending
-changelog entry, an existing completed release, a version older than the latest v3
-tag, module replacements, and a non-stable `delinea-common` dependency.
+changelog entry, an existing GitHub release, a version not newer than the latest
+stable v3 tag, module replacements, and a non-stable `delinea-common` dependency.
 
 If tag creation succeeded but GitHub release creation did not, rerun the same
 version while `main` still identifies the tagged commit. The workflow reruns every

@@ -62,6 +62,4 @@ pre-v1 `delinea-common` dependencies, module replacements, and unreviewed
 transitive modules; reruns the complete offline and required live batteries;
 confirms `main` has not moved; and only then creates an annotated tag and
 source-only GitHub release whose body begins with the reviewed customer-facing
-content above and continues with GitHub's generated change notes. Publishing
-v3.1.0 still requires the compatibility decisions in the release plan to be
-approved.
+content above and continues with GitHub's generated change notes.

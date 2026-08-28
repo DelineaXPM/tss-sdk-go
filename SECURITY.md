@@ -35,7 +35,8 @@ ship it through the normal review and CI process.
 
 tss-sdk-go is distributed as tagged Go module source, not as a prebuilt artifact.
 Stable tags are created only after cross-platform CI and live Secret Server and
-Platform tests pass. GitHub releases contain generated notes and GitHub's source
-snapshots only. Tags are intended to be immutable after publication. The project
-does not currently publish a separate SBOM, signature, or provenance attestation
-for module tags. See `RELEASING.md` for the maintainer procedure.
+Platform tests pass. GitHub releases contain reviewed changelog content, generated
+change notes, and GitHub's source snapshots only. Tags are intended to be immutable
+after publication. The project does not currently publish a separate SBOM,
+signature, or provenance attestation for module tags. See `RELEASING.md` for the
+maintainer procedure.

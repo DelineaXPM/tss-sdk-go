@@ -78,9 +78,9 @@ jobs:
           fi
 
           echo "tag_exists=false" >> "$GITHUB_OUTPUT"
-          latest=$(git tag --list 'v3.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1)
+          latest=$(git tag --list | awk '/^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ { print }' | sort -V | tail -n 1)
           if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "$latest" "$RELEASE_TAG" | sort -V | tail -n 1)" != "$RELEASE_TAG" ]; then
-            echo "Version $RELEASE_TAG must be greater than the latest v3 tag, $latest." >&2
+            echo "Version $RELEASE_TAG must be greater than the latest stable v3 tag, $latest." >&2
             exit 1
           fi
 
