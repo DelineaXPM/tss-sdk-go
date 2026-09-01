@@ -4,7 +4,6 @@ name: Live tenant tests
 # Ordinary pull-request jobs never reference that environment. Strict test flags
 # turn every missing fixture into a failure, not a skip.
 on:
-  workflow_call: {}
   schedule:
     - cron: '29 6 * * 1'
   workflow_dispatch: {}
