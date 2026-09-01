@@ -7,40 +7,45 @@ import (
 // TestSecretTemplate tests SecretTemplate. Referred to as
 // "Test #6" in the README.
 func TestSecretTemplate(t *testing.T) {
-	t.Run("SecretServer_TestSecretTemplate", func(t *testing.T) {
-		tss, err := initServer()
-		if err != nil {
-			t.Error("configuring the Server:", err)
-			return
-		}
-		VerifySecretTemplate(t, tss)
-	})
+	runBattery(t, VerifySecretTemplate)
+}
 
-	t.Run("Platform_TestSecretTemplate", func(t *testing.T) {
-		tss, err := initPlatformServer()
-		if err != nil {
-			t.Error("configuring the Platform Server:", err)
-			return
-		}
-		VerifySecretTemplate(t, tss)
-	})
+// GetField hands out a pointer into the template, so an edit through it is visible on
+// the template the caller then sends back to the server.
+func TestGetFieldAliasesTheTemplateField(t *testing.T) {
+	template := &SecretTemplate{
+		Name: "Password",
+		ID:   6,
+		Fields: []SecretTemplateField{
+			{SecretTemplateFieldID: 108, FieldSlugName: "username"},
+			{SecretTemplateFieldID: 110, FieldSlugName: "password", IsPassword: true, IsRequired: true},
+		},
+	}
+
+	field, found := template.GetField("password")
+	if !found {
+		t.Fatal("GetField did not find the password field")
+	}
+	if field != &template.Fields[1] {
+		t.Error("GetField returned a copy rather than the template's own field")
+	}
+
+	field.IsRequired = false
+	if template.Fields[1].IsRequired {
+		t.Error("an edit through the returned field did not reach the template")
+	}
 }
 
 func VerifySecretTemplate(t *testing.T, tss *Server) {
-	id := initIntegerFromEnv("TSS_TEMPLATE_ID", t)
-	if id < 0 {
-		return
-	}
-
+	id := requireIntEnv(t, "TSS_TEMPLATE_ID")
 	template, err := tss.SecretTemplate(id)
 
 	if err != nil {
-		t.Error("calling secrets.SecretTemplate:", err)
-		return
+		t.Fatal("calling secrets.SecretTemplate:", err)
 	}
 
 	if template == nil {
-		t.Error("secret data is nil")
+		t.Fatal("secret data is nil")
 	}
 
 	for _, field := range template.Fields {
@@ -66,7 +71,8 @@ func VerifySecretTemplate(t *testing.T, tss *Server) {
 			if len(generatedPassword) == 0 || err != nil {
 				t.Errorf("expected to be able to generate a password for the '%s' field; error is '%v'", fieldSlug, err)
 			} else {
-				t.Logf("generated '%s' for the '%s' field", generatedPassword, fieldSlug)
+				// The generated value is a live credential; log its shape, not the value.
+				t.Logf("generated a %d-character password for the '%s' field", len(generatedPassword), fieldSlug)
 			}
 		} else {
 			if len(generatedPassword) > 0 || err == nil {

@@ -1,55 +1,116 @@
 name: Tests
 
 on:
-  workflow_dispatch:
+  workflow_call: {}
+  workflow_dispatch: {}
   push:
-    # Publish the `master` branch.
-    branches:
-      - main
-
-    # Publish `v1.2.3` tags as releases.
-    tags:
-      - v*
-
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  TSS_TENANT: ${{ secrets.TSS_TENANT }}
-  TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
-  TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
-  TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
-  TSS_SECRET_PATH: ${{ secrets.TSS_SECRET_PATH }}
-  TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
-  TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
-  TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
-  TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
-  TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
-  TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
-  TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
-  TSS_PLATFORM_USERNAME: ${{ secrets.TSS_PLATFORM_USERNAME }}
-  TSS_PLATFORM_PASSWORD: ${{ secrets.TSS_PLATFORM_PASSWORD }}
-  TSS_PLATFORM_URL: ${{ secrets.TSS_PLATFORM_URL }}
+  GOWORK: 'off'
 
 jobs:
-  build:
-    name: Build
-    runs-on: ubuntu-latest
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - name: Check out code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Go
-        uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.21'
+          go-version-file: go.mod
+          cache: false
+      - name: gofmt
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        run: go vet ./...
+      - name: test (race)
+        run: go test -race ./...
+      - name: coverage floor
+        if: runner.os == 'Linux'
+        run: |
+          go test -covermode=atomic -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | awk '/^total:/ { seen=1; gsub(/%/, "", $3); print "total coverage: " $3 "%"; if ($3 + 0 < 80.0) exit 1 } END { if (!seen) { print "coverage gate: no total: line from go tool cover"; exit 1 } }'
 
-      - name: Get dependencies
-        run: go get -v -t -d ./...
+  cross-compile:
+    name: Cross-compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: build supported target platforms
+        run: |
+          GOOS=linux   GOARCH=amd64 go build ./...
+          GOOS=linux   GOARCH=arm64 go build ./...
+          GOOS=darwin  GOARCH=arm64 go build ./...
+          GOOS=windows GOARCH=amd64 go build ./...
 
-      - name: Build
-        run: go build -v ./server
+  govulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
-      - name: Test
-        run: go test -v ./server
+  analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+      - name: gosec
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.22.10 -quiet ./...
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+
+  dependencies:
+    name: Dependency boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: module files are tidy and dependency boundary is exact
+        run: |
+          go mod verify
+          cp go.mod go.mod.orig
+          cp go.sum go.sum.orig
+          go mod tidy
+          diff -u go.mod.orig go.mod || { echo 'go.mod is not tidy; run: go mod tidy'; exit 1; }
+          diff -u go.sum.orig go.sum || { echo 'go.sum is not tidy; run: go mod tidy'; exit 1; }
+          modules=$(go list -m -f '{{.Path}}' all)
+          test "$(printf '%s\n' "$modules" | wc -l)" -eq 2
+          printf '%s\n' "$modules" | grep -Fx github.com/DelineaXPM/tss-sdk-go/v3
+          printf '%s\n' "$modules" | grep -Fx github.com/DelineaXPM/delinea-common

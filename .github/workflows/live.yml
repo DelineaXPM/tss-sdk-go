@@ -1,0 +1,68 @@
+name: Live tenant tests
+
+# The main-only live-tests environment holds an isolated identity and fixtures.
+# Ordinary pull-request jobs never reference that environment. Strict test flags
+# turn every missing fixture into a failure, not a skip.
+on:
+  workflow_call: {}
+  schedule:
+    - cron: '29 6 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-tenant-battery
+  cancel-in-progress: false
+
+env:
+  GOWORK: 'off'
+
+jobs:
+  integration:
+    name: Secret Server and Platform (${{ matrix.os }})
+    environment: live-tests
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: run strict live battery
+        env:
+          TSS_REQUIRE_SECRET_SERVER: '1'
+          TSS_REQUIRE_PLATFORM: '1'
+          TSS_SERVER_URL: ${{ secrets.TSS_SERVER_URL }}
+          TSS_USERNAME: ${{ secrets.TSS_USERNAME }}
+          TSS_PASSWORD: ${{ secrets.TSS_PASSWORD }}
+          TSS_SECRET_ID: ${{ secrets.TSS_SECRET_ID }}
+          TSS_SECRET_PATH: ${{ secrets.TSS_SECRET_PATH }}
+          TSS_TEMPLATE_ID: ${{ secrets.TSS_TEMPLATE_ID }}
+          TSS_FOLDER_ID: ${{ secrets.TSS_FOLDER_ID }}
+          TSS_SITE_ID: ${{ secrets.TSS_SITE_ID }}
+          TSS_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_SSH_KEY_TEMPLATE_ID }}
+          TSS_TEST_PASSWORD: ${{ secrets.TSS_TEST_PASSWORD }}
+          TSS_SEARCH_FIELD: ${{ secrets.TSS_SEARCH_FIELD }}
+          TSS_SEARCH_TEXT: ${{ secrets.TSS_SEARCH_TEXT }}
+          TSS_PLATFORM_USERNAME: ${{ secrets.TSS_PLATFORM_CLIENT_ID }}
+          TSS_PLATFORM_PASSWORD: ${{ secrets.TSS_PLATFORM_CLIENT_SECRET }}
+          TSS_PLATFORM_URL: ${{ secrets.TSS_PLATFORM_URL }}
+          TSS_PLATFORM_ALLOWED_VAULT_HOSTS: ${{ secrets.TSS_PLATFORM_ALLOWED_VAULT_HOSTS }}
+          TSS_PLATFORM_SECRET_ID: ${{ secrets.TSS_PLATFORM_SECRET_ID }}
+          TSS_PLATFORM_SECRET_PATH: ${{ secrets.TSS_PLATFORM_SECRET_PATH }}
+          TSS_PLATFORM_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_TEMPLATE_ID }}
+          TSS_PLATFORM_FOLDER_ID: ${{ secrets.TSS_PLATFORM_FOLDER_ID }}
+          TSS_PLATFORM_SITE_ID: ${{ secrets.TSS_PLATFORM_SITE_ID }}
+          TSS_PLATFORM_SSH_KEY_TEMPLATE_ID: ${{ secrets.TSS_PLATFORM_SSH_KEY_TEMPLATE_ID }}
+          TSS_PLATFORM_TEST_PASSWORD: ${{ secrets.TSS_PLATFORM_TEST_PASSWORD }}
+          TSS_PLATFORM_SEARCH_FIELD: ${{ secrets.TSS_PLATFORM_SEARCH_FIELD }}
+          TSS_PLATFORM_SEARCH_TEXT: ${{ secrets.TSS_PLATFORM_SEARCH_TEXT }}
+        run: go test -count=1 -race -v ./server

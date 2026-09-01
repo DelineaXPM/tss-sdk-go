@@ -1,31 +1,237 @@
-name: goreleaser
+name: Verify and publish release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable v3 version declared as unreleased in CHANGELOG.md
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GOWORK: 'off'
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  goreleaser:
+  validate:
+    name: Validate release request
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag_exists: ${{ steps.request.outputs.tag_exists }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate the requested release tag
+        id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Releases must be dispatched from main, not $GITHUB_REF." >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Version must be a stable v3 semantic version such as v3.1.0." >&2
+            exit 1
+          fi
+
+          expected_tag=$(sed -nE 's/^## (v[0-9]+\.[0-9]+\.[0-9]+) \(unreleased\)$/\1/p' CHANGELOG.md | head -n 1)
+          if [ -z "$expected_tag" ]; then
+            echo "CHANGELOG.md has no unreleased stable version heading." >&2
+            exit 1
+          fi
+          if [ "$RELEASE_TAG" != "$expected_tag" ]; then
+            echo "Requested $RELEASE_TAG, but CHANGELOG.md declares $expected_tag as the next release." >&2
+            exit 1
+          fi
+
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            tag_sha=$(git rev-parse "$RELEASE_TAG^{commit}")
+            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "Tag $RELEASE_TAG already identifies $tag_sha, not current main $GITHUB_SHA." >&2
+              exit 1
+            fi
+
+            if release_error=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1 >/dev/null); then
+              echo "Release $RELEASE_TAG already exists." >&2
+              exit 1
+            elif [[ "$release_error" != *"(HTTP 404)"* ]]; then
+              echo "Could not determine whether release $RELEASE_TAG exists." >&2
+              exit 1
+            fi
+
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+            echo "Recovering publication for orphan tag $RELEASE_TAG at $tag_sha."
+            exit 0
+          fi
+
+          echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+          latest=$(git tag --list | awk '/^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ { print }' | sort -V | tail -n 1)
+          if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "$latest" "$RELEASE_TAG" | sort -V | tail -n 1)" != "$RELEASE_TAG" ]; then
+            echo "Version $RELEASE_TAG must be greater than the latest stable v3 tag, $latest." >&2
+            exit 1
+          fi
+
+  dependency:
+    name: Validate release dependency
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Require the public stable delinea-common API
+        run: |
+          set -euo pipefail
+          replacements=$(go mod edit -json | jq '.Replace | length')
+          if [ "$replacements" != 0 ]; then
+            echo "Refusing release with module replacements:" >&2
+            go mod edit -json | jq '.Replace' >&2
+            exit 1
+          fi
+          version=$(go list -m -f '{{.Version}}' github.com/DelineaXPM/delinea-common)
+          if [[ ! "$version" =~ ^v1\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Refusing release with delinea-common $version; require a stable public v1 release." >&2
+            exit 1
+          fi
+
+  ci:
+    name: Complete offline verification
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+
+  integration:
+    name: Required live tenant verification
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/live.yml
+
+  publish:
+    name: Publish verified release
+    needs: [validate, dependency, ci, integration]
     runs-on: ubuntu-latest
     environment: release
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - name: Set up Go 1.13
-        uses: actions/setup-go@6edd4406fa81c3da01a34fa6f6343087c207a568 # v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version: 1.13
-        id: go
-
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
-
-      - name: Get dependencies
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm main has not moved
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          go get -v -t -d ./...
-      - name: Build
-        run: go build -v .
+          set -euo pipefail
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [ "$main_sha" != "$GITHUB_SHA" ]; then
+            echo "main moved from $GITHUB_SHA to $main_sha while release gates ran; dispatch again." >&2
+            exit 1
+          fi
+      - name: Compose reviewed release notes
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          awk -v heading="## $RELEASE_TAG (unreleased)" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found && $0 == "### Release requirements" { exit }
+            found && !started && /^[[:space:]]*$/ { next }
+            found { started = 1; print }
+            END { if (!found || !started) exit 2 }
+          ' CHANGELOG.md > "$notes_file" || {
+            echo "Could not extract reviewed release notes for $RELEASE_TAG from CHANGELOG.md." >&2
+            exit 1
+          }
+          if ! grep -q '[^[:space:]]' "$notes_file"; then
+            echo "Reviewed release notes for $RELEASE_TAG are empty." >&2
+            exit 1
+          fi
+      - name: Create annotated release tag
+        if: needs.validate.outputs.tag_exists != 'true'
+        env:
+          RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_DEPLOY_KEY" ]; then
+            echo "The release environment is missing RELEASE_DEPLOY_KEY." >&2
+            exit 1
+          fi
 
-      - uses: actions/upload-artifact@v4 # v4
-        with:
-          name: artifacts
-          path: tss-sdk-go.exe
+          key_file="$RUNNER_TEMP/release-key"
+          known_hosts="$RUNNER_TEMP/github-known-hosts"
+          cleanup() { rm -f "$key_file" "$known_hosts"; }
+          trap cleanup EXIT
+
+          install -m 600 /dev/null "$key_file"
+          printf '%s\n' "$RELEASE_DEPLOY_KEY" > "$key_file"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$known_hosts"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag --annotate --message "Release $RELEASE_TAG" "$RELEASE_TAG" "$GITHUB_SHA"
+          git -c core.sshCommand="ssh -i $key_file -o IdentitiesOnly=yes -o UserKnownHostsFile=$known_hosts -o StrictHostKeyChecking=yes" \
+            push "git@github.com:$GITHUB_REPOSITORY.git" "refs/tags/$RELEASE_TAG"
+      - name: Publish source-only GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          published=false
+          for attempt in 1 2 3; do
+            if gh release create "$RELEASE_TAG" --verify-tag --generate-notes \
+              --notes-file "$notes_file" --title "$RELEASE_TAG"; then
+              published=true
+              break
+            fi
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              echo "Release $RELEASE_TAG exists despite a lost create response."
+              published=true
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          if [ "$published" != true ]; then
+            echo "Could not publish release $RELEASE_TAG after three attempts; rerun this workflow to recover." >&2
+            exit 1
+          fi
+
+          test "$(gh release view "$RELEASE_TAG" --json tagName --jq .tagName)" = "$RELEASE_TAG"
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = false
+          test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease)" = false
+          test "$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')" -eq 0
+          published_notes="$RUNNER_TEMP/published-release-notes.md"
+          gh release view "$RELEASE_TAG" --json body --jq .body > "$published_notes"
+          prefix_bytes=$(wc -c < "$notes_file")
+          if ! head -c "$prefix_bytes" "$published_notes" | cmp -s "$notes_file" -; then
+            echo "Published release notes do not begin with the reviewed changelog content." >&2
+            exit 1
+          fi
