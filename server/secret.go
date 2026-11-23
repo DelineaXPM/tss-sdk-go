@@ -50,6 +50,44 @@ type Secret struct {
 	RequiresComment, SessionRecordingEnabled, WebLauncherRequiresIncognitoMode bool
 	Fields                                                                     []SecretField `json:"Items"`
 	SshKeyArgs                                                                 *SshKeyArgs   `json:",omitempty"`
+
+	// Read-only rotation and heartbeat status reported by Secret Server. They
+	// are nil when the server reports no value, and are never sent on create
+	// or update. Dates are passed through exactly as the server formats them.
+	//
+	// LastPasswordChangeAttempt records the last Remote Password Changer
+	// attempt, successful or not; it does not reflect manual password edits.
+	LastPasswordChangeAttempt *string          `json:",omitempty"`
+	LastHeartBeatCheck        *string          `json:",omitempty"`
+	LastHeartBeatStatus       *HeartbeatStatus `json:",omitempty"`
+}
+
+// HeartbeatStatus is the result of a secret's last heartbeat, such as
+// "Success" or "Failed". It accepts the status as a JSON string or as a
+// numeric enum value, so an unexpected encoding never fails the whole read.
+type HeartbeatStatus string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (h *HeartbeatStatus) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		*h = HeartbeatStatus(text)
+		return nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(data, &number); err != nil {
+		return fmt.Errorf("heartbeat status must be a string or number: %w", err)
+	}
+	*h = HeartbeatStatus(number.String())
+	return nil
+}
+
+// clearReadOnlyStatus removes server-reported status so write requests carry
+// only the values a caller can set.
+func (s *Secret) clearReadOnlyStatus() {
+	s.LastPasswordChangeAttempt = nil
+	s.LastHeartBeatCheck = nil
+	s.LastHeartBeatStatus = nil
 }
 
 // SecretField is an item (field) in the secret
@@ -307,6 +345,10 @@ func (s Server) writeSecretContext(ctx context.Context, secret Secret, method, p
 			secret.SshKeyArgs = nil
 		}
 	}
+
+	// A secret read and then written back carries server-reported status;
+	// keep the request body identical to what callers could send before.
+	secret.clearReadOnlyStatus()
 
 	// If the user specifies no items, perhaps because all the fields are
 	// generated, apply an empty array to keep the server from rejecting the

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Read-only `Secret.LastPasswordChangeAttempt`, `Secret.LastHeartBeatCheck`,
+  and `Secret.LastHeartBeatStatus` from the Secret Server secret model, so
+  callers can check rotation and heartbeat state. They are nil when the server
+  reports no value and are never sent on create or update.
+  `LastPasswordChangeAttempt` records the last Remote Password Changer
+  attempt, successful or not, and does not reflect manual password edits.
+
 ## v3.1.0 (unreleased)
 
 This release replaces the SDK's bespoke authentication and transport engine with
