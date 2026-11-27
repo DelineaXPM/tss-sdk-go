@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // resource is the HTTP URL path component for the secrets resource
@@ -53,7 +55,9 @@ type Secret struct {
 
 	// Read-only rotation and heartbeat status reported by Secret Server. They
 	// are nil when the server reports no value, and are never sent on create
-	// or update. Dates are passed through exactly as the server formats them.
+	// or update. Dates are RFC 3339 UTC: Secret Server sends UTC times without
+	// a zone designator, so the SDK appends "Z", and its "never happened"
+	// placeholder (0001-01-01T00:00:00) is returned as nil.
 	//
 	// LastPasswordChangeAttempt records the last Remote Password Changer
 	// attempt, successful or not; it does not reflect manual password edits.
@@ -80,6 +84,35 @@ func (h *HeartbeatStatus) UnmarshalJSON(data []byte) error {
 	}
 	*h = HeartbeatStatus(number.String())
 	return nil
+}
+
+// neverDatePrefix is how Secret Server encodes an empty date (.NET
+// DateTime.MinValue), for example a heartbeat that has never run.
+const neverDatePrefix = "0001-01-01T00:00:00"
+
+// serverLocalDateLayout matches a Secret Server date with no zone designator.
+// Parsing also accepts trailing fractional seconds.
+const serverLocalDateLayout = "2006-01-02T15:04:05"
+
+// normalizeStatusDates turns the server's empty-date placeholder into nil and
+// marks zone-less dates as UTC, so callers and JSON built from the struct get
+// either no value or a valid RFC 3339 timestamp.
+func (s *Secret) normalizeStatusDates() {
+	s.LastPasswordChangeAttempt = normalizeStatusDate(s.LastPasswordChangeAttempt)
+	s.LastHeartBeatCheck = normalizeStatusDate(s.LastHeartBeatCheck)
+}
+
+func normalizeStatusDate(value *string) *string {
+	if value == nil || strings.HasPrefix(*value, neverDatePrefix) {
+		return nil
+	}
+	// Secret Server reports these times in UTC without a "Z". Values that
+	// already carry a zone, or are in an unexpected format, are left as is.
+	if _, err := time.Parse(serverLocalDateLayout, *value); err == nil {
+		utc := *value + "Z"
+		return &utc
+	}
+	return value
 }
 
 // clearReadOnlyStatus removes server-reported status so write requests carry
@@ -159,6 +192,7 @@ func (s Server) secretContext(ctx context.Context, id int, budget *operationBudg
 	if secret.ID != id {
 		return nil, fmt.Errorf("secret response ID %d does not match the requested ID %d", secret.ID, id)
 	}
+	secret.normalizeStatusDates()
 
 	if err := s.downloadAttachmentsContext(ctx, secret, budget); err != nil {
 		return nil, err
@@ -268,6 +302,7 @@ func (s Server) SecretByPathContext(ctx context.Context, secretPath string) (*Se
 	if secret.ID <= 0 {
 		return nil, fmt.Errorf("secret-by-path response contained no positive secret ID")
 	}
+	secret.normalizeStatusDates()
 
 	if err := s.downloadAttachmentsContext(ctx, secret, budget); err != nil {
 		return nil, err
