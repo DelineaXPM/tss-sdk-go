@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Read-only `Secret.LastPasswordChangeAttempt`, `Secret.LastHeartBeatCheck`,
+  and `Secret.LastHeartBeatStatus` from the Secret Server secret model, so
+  callers can check rotation and heartbeat state. They are nil when the server
+  reports no value, including Secret Server's `0001-01-01T00:00:00`
+  placeholder for a heartbeat or password change that has never happened, and
+  are never sent on create or update. Secret Server sends these dates in UTC
+  without a zone designator; the SDK appends `Z` so they are RFC 3339.
+  `LastPasswordChangeAttempt` records the last Remote Password Changer
+  attempt, successful or not, and does not reflect manual password edits.
+
 ## v3.1.0 (unreleased)
 
 This release replaces the SDK's bespoke authentication and transport engine with
